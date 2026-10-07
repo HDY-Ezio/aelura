@@ -264,7 +264,7 @@ DEFAULT_CONFIG: dict = {
     },
     "browser": {
         "headless": True,
-        "timeout": 20000,
+        "timeout": 20,
     },
     "proxy_pool": {
         "auto_refresh": False,

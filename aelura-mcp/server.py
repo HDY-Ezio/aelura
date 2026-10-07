@@ -178,12 +178,14 @@ def scrape_with_browser(url: str, headless: bool = True,
     try:
         screenshot_path = None
         if screenshot:
+            import hashlib
             import tempfile
-            screenshot_path = str(Path(tempfile.gettempdir()) / f"aelura_screenshot_{hash(url)}.png")
+            url_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
+            screenshot_path = str(Path(tempfile.gettempdir()) / f"aelura_screenshot_{url_hash}.png")
 
         result = fetch_browser(
             url, headless=headless,
-            timeout=timeout * 1000,  # 转为毫秒
+            timeout=timeout,
             screenshot_path=screenshot_path,
         )
         data = _format_result(result)
