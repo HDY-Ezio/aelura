@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """
 Aelura 公共工具模块
-提供共享的导入辅助、URL 校验（含 SSRF 防护）、配置加载等功能。
+提供共享的导入辅助、URL 校验（含 SSRF 防护）、配置加载、资源生命周期管理。
+
+v1.1: 
+  - SSRF 防护增加 DNS 解析（防 DNS rebinding）
+  - 统一资源清理（atexit）
+  - 表名常量化
+  - deepcopy 替代 JSON hack
 """
 
 from __future__ import annotations
 
+import atexit
+import copy
 import ipaddress
 import json
 import logging
+import socket
 from pathlib import Path
 from typing import Optional, Tuple, Any
 from urllib.parse import urlparse
@@ -21,8 +30,13 @@ logger = logging.getLogger(__name__)
 MIN_CONTENT_LENGTH: int = 100  # 内容有效性的最低字符长度
 VALID_SCHEMES: set = {"http", "https"}
 
+# SQLite 表名常量（消除魔法字符串）
+PROXY_TABLE_NAME: str = "proxies"
+PROXY_USAGE_TABLE_NAME: str = "proxy_usage"
+CACHE_TABLE_NAME: str = "page_cache"
+
 # ============================================================
-# SSRF 防护
+# SSRF 防护（含 DNS 解析）
 # ============================================================
 _BLOCKED_IP_RANGES = [
     ipaddress.ip_network("127.0.0.0/8"),
@@ -37,18 +51,40 @@ _BLOCKED_IP_RANGES = [
 ]
 
 
-def is_private_host(hostname: str) -> bool:
-    """检查 hostname 是否为内网/回环地址。
-
-    对于域名（非 IP 地址），返回 False（不做 DNS 解析，
-    避免 DNS rebinding 攻击的复杂性在此层面处理）。
-    """
+def _is_blocked_ip(ip_str: str) -> bool:
+    """检查 IP 地址是否在封锁列表中。"""
     try:
-        ip = ipaddress.ip_address(hostname)
+        ip = ipaddress.ip_address(ip_str)
         return any(ip in net for net in _BLOCKED_IP_RANGES)
     except ValueError:
-        # 不是合法 IP 地址，说明是域名
         return False
+
+
+def is_private_host(hostname: str) -> bool:
+    """检查 hostname 是否为内网/回环地址。
+    
+    先检查是否为字面 IP，如果是则直接判断；
+    否则做 DNS 解析，检查解析后的 IP 地址。
+    这样可以防止 DNS rebinding 攻击。
+    """
+    # 先检查是否为字面 IP
+    if _is_blocked_ip(hostname):
+        return True
+    
+    # 如果是域名，做 DNS 解析
+    try:
+        # getaddrinfo 返回 (family, type, proto, canonname, sockaddr)
+        # sockaddr 是 (address, port) 元组
+        addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for family, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            if _is_blocked_ip(ip_str):
+                return True
+    except (socket.gaierror, socket.herror, OSError):
+        # DNS 解析失败，放行（让后续请求处理）
+        pass
+    
+    return False
 
 
 def validate_url(url: str) -> Optional[str]:
@@ -123,9 +159,35 @@ def try_import_playwright() -> Tuple[bool, Any]:
 
 
 # ============================================================
+# 资源生命周期管理（atexit 清理）
+# ============================================================
+_cleanup_callbacks: list = []
+
+
+def register_cleanup(callback, *args, **kwargs) -> None:
+    """注册退出时的清理回调。"""
+    _cleanup_callbacks.append((callback, args, kwargs))
+
+
+def _run_cleanup() -> None:
+    """执行所有注册的清理回调。"""
+    for callback, args, kwargs in reversed(_cleanup_callbacks):
+        try:
+            callback(*args, **kwargs)
+        except Exception as e:
+            logger.debug("[Cleanup] 清理回调异常: %s", e)
+    _cleanup_callbacks.clear()
+
+
+# 注册 atexit 处理器
+atexit.register(_run_cleanup)
+
+
+# ============================================================
 # SQLite 连接复用
 # ============================================================
 _db_connections: dict = {}
+_db_initialized: set = set()  # 追踪已初始化的数据库
 
 
 def get_db(db_path) -> Any:
@@ -143,8 +205,22 @@ def get_db(db_path) -> Any:
     if path_str not in _db_connections:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         import sqlite3
-        _db_connections[path_str] = sqlite3.connect(str(db_path))
+        try:
+            _db_connections[path_str] = sqlite3.connect(str(db_path))
+        except sqlite3.Error as e:
+            logger.error("[DB] 连接失败 %s: %s", db_path, e)
+            raise
     return _db_connections[path_str]
+
+
+def mark_db_initialized(db_path) -> None:
+    """标记数据库已初始化（避免重复 CREATE TABLE）。"""
+    _db_initialized.add(str(db_path))
+
+
+def is_db_initialized(db_path) -> bool:
+    """检查数据库是否已初始化。"""
+    return str(db_path) in _db_initialized
 
 
 def close_all_db() -> None:
@@ -155,6 +231,11 @@ def close_all_db() -> None:
         except Exception:
             pass
     _db_connections.clear()
+    _db_initialized.clear()
+
+
+# 注册 atexit 清理
+register_cleanup(close_all_db)
 
 
 # ============================================================
@@ -206,7 +287,7 @@ def load_config(config_path: Optional[str] = None) -> dict:
     Returns:
         合并后的配置字典。
     """
-    config = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
+    config = copy.deepcopy(DEFAULT_CONFIG)
 
     if config_path is None:
         default_paths = [

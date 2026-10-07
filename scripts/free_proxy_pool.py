@@ -17,7 +17,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
-from utils import try_import_curl_cffi, get_db
+from utils import try_import_curl_cffi, get_db, mark_db_initialized, is_db_initialized
+from utils import PROXY_TABLE_NAME, PROXY_USAGE_TABLE_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -155,13 +156,16 @@ def _validate_proxy_format(ip: str, port: int) -> bool:
 
 
 # ============================================================
-# SQLite 存储（使用共享连接池）
+# SQLite 存储（使用共享连接池 + 初始化追踪）
 # ============================================================
 def _init_db():
-    """初始化代理数据库表。"""
+    """初始化代理数据库表（仅首次调用时执行）。"""
+    if is_db_initialized(PROXY_DB_PATH):
+        return
+    
     conn = get_db(PROXY_DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS proxies (
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {PROXY_TABLE_NAME} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ip TEXT NOT NULL,
             port INTEGER NOT NULL,
@@ -174,16 +178,17 @@ def _init_db():
             UNIQUE(ip, port)
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS proxy_usage (
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS {PROXY_USAGE_TABLE_NAME} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             proxy_id INTEGER,
             used_at TEXT DEFAULT (datetime('now')),
             success INTEGER DEFAULT 1,
-            FOREIGN KEY(proxy_id) REFERENCES proxies(id)
+            FOREIGN KEY(proxy_id) REFERENCES {PROXY_TABLE_NAME}(id)
         )
     """)
     conn.commit()
+    mark_db_initialized(PROXY_DB_PATH)
 
 
 def save_proxies(proxies: List[Dict]) -> None:
@@ -193,7 +198,7 @@ def save_proxies(proxies: List[Dict]) -> None:
     for p in proxies:
         try:
             conn.execute(
-                "INSERT OR IGNORE INTO proxies (ip, port, source) VALUES (?, ?, ?)",
+                f"INSERT OR IGNORE INTO {PROXY_TABLE_NAME} (ip, port, source) VALUES (?, ?, ?)",
                 (p["ip"], p["port"], p.get("source", "")),
             )
         except Exception as e:
@@ -221,18 +226,26 @@ def refresh_proxy_pool() -> int:
 def check_proxy_alive() -> int:
     """检测数据库中所有代理的存活状态。
 
+    每次检测间隔 0.2 秒，避免被 httpbin.org 限流。
+
     Returns:
         存活代理数量。
     """
     _init_db()
     conn = get_db(PROXY_DB_PATH)
-    cursor = conn.execute("SELECT id, ip, port FROM proxies WHERE is_alive = 1")
+    cursor = conn.execute(
+        f"SELECT id, ip, port FROM {PROXY_TABLE_NAME} WHERE is_alive = 1"
+    )
     rows = cursor.fetchall()
 
     has_cffi, cffi = try_import_curl_cffi()
     alive_count = 0
 
-    for proxy_id, ip, port in rows:
+    for i, (proxy_id, ip, port) in enumerate(rows):
+        # 限流：每 0.2 秒检测一个，避免被目标站 ban
+        if i > 0:
+            time.sleep(0.2)
+        
         proxy_url = f"http://{ip}:{port}"
         start_time = time.time()
         try:
@@ -245,30 +258,30 @@ def check_proxy_alive() -> int:
                 elapsed = time.time() - start_time
                 if resp.status_code == 200:
                     conn.execute(
-                        "UPDATE proxies SET is_alive=1, response_time=?, last_checked=datetime('now') WHERE id=?",
+                        f"UPDATE {PROXY_TABLE_NAME} SET is_alive=1, response_time=?, last_checked=datetime('now') WHERE id=?",
                         (elapsed, proxy_id),
                     )
                     alive_count += 1
                 else:
                     conn.execute(
-                        "UPDATE proxies SET fail_count=fail_count+1, last_checked=datetime('now') WHERE id=?",
+                        f"UPDATE {PROXY_TABLE_NAME} SET fail_count=fail_count+1, last_checked=datetime('now') WHERE id=?",
                         (proxy_id,),
                     )
             else:
                 conn.execute(
-                    "UPDATE proxies SET is_alive=0, last_checked=datetime('now') WHERE id=?",
+                    f"UPDATE {PROXY_TABLE_NAME} SET is_alive=0, last_checked=datetime('now') WHERE id=?",
                     (proxy_id,),
                 )
         except Exception:
             conn.execute(
-                "UPDATE proxies SET fail_count=fail_count+1, is_alive=0, last_checked=datetime('now') WHERE id=?",
+                f"UPDATE {PROXY_TABLE_NAME} SET fail_count=fail_count+1, is_alive=0, last_checked=datetime('now') WHERE id=?",
                 (proxy_id,),
             )
 
     conn.commit()
 
     # 清理超过最大失败次数的代理
-    conn.execute(f"DELETE FROM proxies WHERE fail_count >= {MAX_FAIL_COUNT}")
+    conn.execute(f"DELETE FROM {PROXY_TABLE_NAME} WHERE fail_count >= ?", (MAX_FAIL_COUNT,))
     conn.commit()
 
     logger.info("[ProxyPool] 存活代理: %d / %d", alive_count, len(rows))
@@ -291,7 +304,7 @@ def get_available_proxies(limit: int = 20) -> List[str]:
 
     # 优先选响应时间 < 5s 且失败 < 3 次的
     cursor = conn.execute(
-        "SELECT ip, port FROM proxies WHERE is_alive=1 AND response_time < ? AND fail_count < 3 "
+        f"SELECT ip, port FROM {PROXY_TABLE_NAME} WHERE is_alive=1 AND response_time < ? AND fail_count < 3 "
         "ORDER BY response_time ASC LIMIT ?",
         (GOOD_RESPONSE_TIME, limit),
     )
@@ -300,7 +313,7 @@ def get_available_proxies(limit: int = 20) -> List[str]:
     # 不够的话放宽条件
     if len(results) < limit:
         cursor = conn.execute(
-            "SELECT ip, port FROM proxies WHERE is_alive=1 AND fail_count < ? "
+            f"SELECT ip, port FROM {PROXY_TABLE_NAME} WHERE is_alive=1 AND fail_count < ? "
             "ORDER BY response_time ASC LIMIT ?",
             (MAX_FAIL_COUNT, limit),
         )
@@ -341,18 +354,18 @@ def record_usage(proxy: str, success: bool) -> None:
         logger.warning("[ProxyPool] record_usage: 端口非数字 '%s'", proxy)
         return
 
-    cursor = conn.execute("SELECT id FROM proxies WHERE ip=? AND port=?", (ip, port))
+    cursor = conn.execute(f"SELECT id FROM {PROXY_TABLE_NAME} WHERE ip=? AND port=?", (ip, port))
     row = cursor.fetchone()
     if row:
         proxy_id = row[0]
         conn.execute(
-            "INSERT INTO proxies_usage (proxy_id, success) VALUES (?, ?)",
+            f"INSERT INTO {PROXY_USAGE_TABLE_NAME} (proxy_id, success) VALUES (?, ?)",
             (proxy_id, 1 if success else 0),
         )
         if not success:
-            conn.execute("UPDATE proxies SET fail_count=fail_count+1 WHERE id=?", (proxy_id,))
+            conn.execute(f"UPDATE {PROXY_TABLE_NAME} SET fail_count=fail_count+1 WHERE id=?", (proxy_id,))
         else:
-            conn.execute("UPDATE proxies SET fail_count=MAX(0,fail_count-1) WHERE id=?", (proxy_id,))
+            conn.execute(f"UPDATE {PROXY_TABLE_NAME} SET fail_count=MAX(0,fail_count-1) WHERE id=?", (proxy_id,))
         conn.commit()
 
 

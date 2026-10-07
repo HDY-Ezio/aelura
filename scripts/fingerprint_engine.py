@@ -136,14 +136,16 @@ class FingerprintEngine:
                 "timezone": timezone,
                 "locale": language,
                 "platform": "Win32" if "Win" in ua else ("MacIntel" if "Mac" in ua else ("Linux" if "X11" in ua else "")),
-                "hardware_concurrency": self._rng.choice([2, 4, 6, 8, 12, 16]),
+                # 真实硬件参数：只使用 2 的幂（真实系统不会出现 6/12）
+                "hardware_concurrency": self._rng.choice([2, 4, 8, 16]),
                 "device_memory": self._rng.choice([2, 4, 8, 16, 32]),
-                "color_depth": self._rng.choice([24, 32]),
+                # 现代浏览器统一报告 24（32 不自然，会被反爬系统识别）
+                "color_depth": 24,
                 "color_scheme": self._rng.choice(["light", "light", "light", "dark"]),
             }
 
-            # 去重 key
-            fp_key = hashlib.md5(str(sorted(fingerprint.items())).encode()).hexdigest()
+            # 去重 key（统一使用 SHA-256，与 PageCache 一致）
+            fp_key = hashlib.sha256(str(sorted(fingerprint.items())).encode()).hexdigest()
 
             if fp_key not in self._used or len(self._used) >= self._max_unique:
                 if len(self._used) >= self._max_unique:

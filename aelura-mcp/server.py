@@ -27,16 +27,35 @@ SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-# 直接导入核心模块
-from web_scrape import (
-    smart_fetch,
-    async_bulk_scrape,
-    fetch_browser,
-    get_degradation_stats,
-    _browser_manager,
-)
-from enhancer import discover_sitemap as _discover_sitemap, ScrapingEnhancer
-from free_proxy_pool import refresh_proxy_pool, get_available_proxies
+# 安全导入核心模块（缺失依赖时优雅降级，不阻塞 MCP Server 启动）
+try:
+    from web_scrape import (
+        smart_fetch,
+        async_bulk_scrape,
+        fetch_browser,
+        get_degradation_stats,
+        _BrowserManager,
+    )
+    _import_error = None
+except ImportError as e:
+    _import_error = str(e)
+    smart_fetch = None
+    async_bulk_scrape = None
+    fetch_browser = None
+    get_degradation_stats = None
+    _BrowserManager = None
+
+try:
+    from enhancer import discover_sitemap as _discover_sitemap, ScrapingEnhancer
+except ImportError:
+    _discover_sitemap = None
+    ScrapingEnhancer = None
+
+try:
+    from free_proxy_pool import refresh_proxy_pool, get_available_proxies
+except ImportError:
+    refresh_proxy_pool = None
+    get_available_proxies = None
 
 # 日志配置
 logger = logging.getLogger("aelura.mcp")
@@ -54,6 +73,15 @@ mcp = FastMCP(
 # ============================================================
 # 辅助函数
 # ============================================================
+def _check_imports() -> Optional[str]:
+    """检查核心模块是否导入成功。返回 None 表示正常，否则返回错误信息。"""
+    if _import_error:
+        return f"核心模块导入失败: {_import_error}"
+    if smart_fetch is None:
+        return "web_scrape 模块未加载，请检查依赖是否安装"
+    return None
+
+
 def _format_result(result) -> dict:
     """将 _BaseResponse 格式化为 MCP 返回字典。"""
     if not result or result.status == 0:

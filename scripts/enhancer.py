@@ -81,6 +81,11 @@ def check_page_changed(url: str, headers: Optional[Dict] = None) -> Tuple[bool, 
 
     try:
         import requests
+    except ImportError:
+        logger.debug("[Enhancer] requests 未安装，跳过条件请求检查")
+        return True, None
+
+    try:
         conditional_headers = {}
         if headers:
             if "ETag" in headers:
@@ -169,13 +174,15 @@ def discover_sitemap(domain: str, depth: int = 0) -> List[str]:
     # 1. 检查 robots.txt
     robots_url = f"{domain.rstrip('/')}/robots.txt"
     try:
-        import requests
-        resp = requests.get(robots_url, timeout=10)
+        import requests as _req
+        resp = _req.get(robots_url, timeout=10)
         if resp.status_code == 200:
             for line in resp.text.split("\n"):
                 if line.lower().startswith("sitemap:"):
                     sitemap_url = line.split(":", 1)[1].strip()
                     sitemap_urls_to_check.append(sitemap_url)
+    except ImportError:
+        logger.debug("[Enhancer] requests 未安装，跳过 robots.txt 检查")
     except Exception as e:
         logger.debug("[Enhancer] robots.txt 读取失败: %s", e)
 
@@ -188,11 +195,16 @@ def discover_sitemap(domain: str, depth: int = 0) -> List[str]:
     sitemap_urls_to_check = list(set(sitemap_urls_to_check))
 
     # 3. 解析每个 sitemap
-    import requests
+    try:
+        import requests as _req
+    except ImportError:
+        logger.warning("[Enhancer] requests 未安装，无法解析 sitemap")
+        return urls
+
     for sitemap_url in sitemap_urls_to_check:
         try:
             time.sleep(SITEMAP_DELAY)
-            resp = requests.get(sitemap_url, timeout=10)
+            resp = _req.get(sitemap_url, timeout=10)
             if resp.status_code == 200:
                 content = resp.text
                 # 提取 <loc> 标签
@@ -334,8 +346,11 @@ class RobotsChecker:
     def _extract_crawl_delay(self, robots_url: str, domain: str) -> None:
         """提取 robots.txt 中的 Crawl-delay 值。"""
         try:
-            import requests
-            resp = requests.get(robots_url, timeout=5)
+            import requests as _req
+        except ImportError:
+            return
+        try:
+            resp = _req.get(robots_url, timeout=5)
             if resp.status_code == 200:
                 for line in resp.text.split("\n"):
                     line = line.strip().lower()

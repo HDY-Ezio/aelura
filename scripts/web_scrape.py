@@ -33,6 +33,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
@@ -43,8 +44,13 @@ from utils import (
     try_import_scrapling,
     try_import_playwright,
     validate_url,
+    validate_cookie_name,
+    validate_cookie_value,
     load_config,
     MIN_CONTENT_LENGTH,
+    DEFAULT_MODE,
+    DEFAULT_OUTPUT,
+    register_cleanup,
 )
 
 # ============================================================
@@ -158,22 +164,37 @@ class _BrowserPage(_BaseResponse):
 # 浏览器管理器（实例复用）
 # ============================================================
 class _BrowserManager:
-    """管理 Playwright 浏览器实例的生命周期，避免重复启动。"""
+    """管理 Playwright 浏览器实例的生命周期，避免重复启动。
+
+    线程安全：使用锁保护浏览器创建/销毁，支持 asyncio.to_thread 并发场景。
+    """
 
     def __init__(self):
         self._playwright = None
         self._browser = None
+        self._headless = True
+        self._lock = threading.Lock()
+        register_cleanup(self.close)
 
     def _ensure_browser(self, headless: bool = True):
-        """确保浏览器实例已启动。"""
-        if self._browser is None:
-            ok, sync_playwright = try_import_playwright()
-            if not ok:
-                raise ImportError("Playwright 未安装，无法启动浏览器")
-            self._playwright = sync_playwright().start()
-            self._browser = self._playwright.chromium.launch(headless=headless)
-            logger.debug("[BrowserManager] 浏览器实例已启动")
-        return self._browser
+        """确保浏览器实例已启动。如果 headless 模式变化，重启浏览器。"""
+        with self._lock:
+            if self._browser is None or self._headless != headless:
+                # headless 模式变化或首次启动
+                if self._browser is not None:
+                    try:
+                        self._browser.close()
+                    except Exception:
+                        pass
+                ok, sync_playwright = try_import_playwright()
+                if not ok:
+                    raise ImportError("Playwright 未安装，无法启动浏览器")
+                if self._playwright is None:
+                    self._playwright = sync_playwright().start()
+                self._browser = self._playwright.chromium.launch(headless=headless)
+                self._headless = headless
+                logger.debug("[BrowserManager] 浏览器实例已启动 (headless=%s)", headless)
+            return self._browser
 
     def new_context(self, fp_args: Optional[dict] = None, proxy: Optional[str] = None, **kwargs):
         """在已有浏览器上创建新的上下文。"""
@@ -367,10 +388,13 @@ def fetch_browser(
     proxy: Optional[str] = None,
     headless: bool = True,
     wait_until: str = "networkidle",
-    timeout: float = 20000.0,
+    timeout: float = 20.0,
     screenshot_path: Optional[str] = None,
 ) -> _BaseResponse:
-    """L5: 使用 Playwright 真实浏览器抓取，复用浏览器实例。"""
+    """L5: 使用 Playwright 真实浏览器抓取，复用浏览器实例。
+
+    注意：timeout 统一使用秒为单位，内部自动转换为毫秒传给 Playwright。
+    """
     ok, _ = try_import_playwright()
     if not ok:
         _count_degradation("L5_unavailable")
@@ -384,13 +408,15 @@ def fetch_browser(
     manager = _get_browser_manager()
     context = None
     page = None
+    # Playwright 使用毫秒，统一在此处转换
+    pw_timeout_ms = int(timeout * 1000) if timeout < 1000 else int(timeout)
     try:
         context = manager.new_context(fp_args=fp, proxy=proxy, headless=headless)
         page = context.new_page()
 
         # 行为模拟：设置随机 viewport 偏移
-        page.set_default_timeout(timeout)
-        page.goto(url, wait_until=wait_until, timeout=timeout)
+        page.set_default_timeout(pw_timeout_ms)
+        page.goto(url, wait_until=wait_until, timeout=pw_timeout_ms)
 
         # 可选截图
         if screenshot_path:
@@ -422,48 +448,6 @@ def fetch_browser(
                 context.close()
         except Exception:
             pass
-
-
-# ============================================================
-# Cookie 校验
-# ============================================================
-def validate_cookie_value(value: str) -> bool:
-    """校验 cookie 值的合法性。
-
-    过滤包含控制字符或明显注入特征的值。
-
-    Args:
-        value: cookie 值字符串。
-
-    Returns:
-        True 表示合法，False 表示应跳过。
-    """
-    if not value:
-        return False
-    # 禁止包含换行/回车（防止 header 注入）
-    if any(c in value for c in ("\r", "\n", "\0")):
-        return False
-    return True
-
-
-def validate_cookie_name(name: str) -> bool:
-    """校验 cookie 名称的合法性。
-
-    Cookie 名称只允许 token 字符（RFC 6265）。
-
-    Args:
-        name: cookie 名称。
-
-    Returns:
-        True 表示合法，False 表示应跳过。
-    """
-    if not name:
-        return False
-    # RFC 6265 token chars: 排除分隔符和控制字符
-    separators = set("()<>@,;:\\\"/[]?={} \t")
-    if any(c in separators or ord(c) < 32 for c in name):
-        return False
-    return True
 
 
 # ============================================================
@@ -520,99 +504,88 @@ def smart_fetch(
 
     # 代理池
     proxies: List[Optional[str]] = [None]
+    real_proxies: List[str] = []
     if proxy_enabled:
-        try:
-            from free_proxy_pool import get_available_proxies
-            proxy_list = get_available_proxies(limit=5)
-            if proxy_list:
-                proxies = proxy_list
-                logger.info("[smart_fetch] 代理池就绪，%d 个可用代理", len(proxies))
-        except ImportError:
-            logger.warning("[smart_fetch] free_proxy_pool 未安装，跳过代理")
+        proxy_list = get_available_proxies(limit=5)
+        if proxy_list:
+            real_proxies = proxy_list
+            proxies = proxy_list
+            logger.info("[smart_fetch] 代理池就绪，%d 个可用代理", len(proxies))
 
-    # 如果指定了固定模式，只尝试该模式
-    mode_map = {
-        "tls": [fetch_tls],
-        "http": [fetch_http],
-        "stealth": [fetch_stealth],
-        "browser": [fetch_browser],
-    }
+    # auto 模式的降级链定义（声明式，便于扩展新层级）
+    # 每项: (fetch_func, level_label, is_browser)
+    _AUTO_CHAIN: List[Tuple[Any, str, bool]] = [
+        (fetch_stealth, "L4", False),
+        (fetch_tls, "L2", False),
+        (fetch_http, "L3", False),
+        (fetch_browser, "L5", True),
+    ]
 
-    if mode in mode_map:
-        fetch_funcs = mode_map[mode]
-    else:
-        # auto 模式：先无代理，再加代理
-        fetch_funcs = []  # 会在下面动态构建
+    def _is_success(resp: _BaseResponse) -> bool:
+        """统一的成功判断逻辑。"""
+        return bool(resp.status and resp.status < 400 and len(resp.get_all_text()) >= MIN_CONTENT_LENGTH)
 
-    # auto 模式：先直连，再加代理
-    if mode == "auto":
-        # Phase 1: 无代理直连
-        if warmup:
-            result = fetch_stealth(url, fp=fp, proxy=None, method=method, data=data, timeout=timeout)
-            if result.status and result.status < 400 and len(result.get_all_text()) >= MIN_CONTENT_LENGTH:
-                return result
-            _count_degradation("L4_fail_no_proxy")
-
-        result = fetch_tls(url, fp=fp, proxy=None, method=method, data=data, timeout=timeout)
-        if result.status and result.status < 400 and len(result.get_all_text()) >= MIN_CONTENT_LENGTH:
-            return result
-        _count_degradation("L2_fail_no_proxy")
-
-        result = fetch_http(url, proxy=None, method=method, data=data, timeout=timeout)
-        if result.status and result.status < 400 and len(result.get_all_text()) >= MIN_CONTENT_LENGTH:
-            return result
-        _count_degradation("L3_fail_no_proxy")
-
-        browser_timeout = timeout * 1000 if timeout < 1000 else timeout
-        result = fetch_browser(url, fp=fp, proxy=None, headless=headless, timeout=browser_timeout,
-                               screenshot_path=screenshot_path)
-        if result.status and result.status < 400 and len(result.get_all_text()) >= MIN_CONTENT_LENGTH:
-            return result
-        _count_degradation("L5_fail_no_proxy")
-
-        # Phase 2: 加代理重试
-        if proxies and proxies[0] is not None:
-            logger.info("[smart_fetch] 直连全部失败，启用代理重试...")
-        for proxy in proxies:
-            if proxy is None:
+    def _run_chain(proxy: Optional[str], phase_label: str) -> Optional[_BaseResponse]:
+        """按降级链顺序执行，返回第一个成功的结果。"""
+        for fetch_fn, level, is_browser in _AUTO_CHAIN:
+            # warmup 模式下才执行 L4，否则跳过
+            if fetch_fn is fetch_stealth and not warmup:
                 continue
-            result = fetch_tls(url, fp=fp, proxy=proxy, method=method, data=data, timeout=timeout)
-            if result.status and result.status < 400 and len(result.get_all_text()) >= MIN_CONTENT_LENGTH:
-                return result
-            _count_degradation("L2_fail_with_proxy")
-
-            result = fetch_http(url, proxy=proxy, method=method, data=data, timeout=timeout)
-            if result.status and result.status < 400 and len(result.get_all_text()) >= MIN_CONTENT_LENGTH:
-                return result
-            _count_degradation("L3_fail_with_proxy")
-
-        # 最终兜底：浏览器 + 代理
-        for proxy in proxies:
-            if proxy is None:
-                continue
-            result = fetch_browser(url, fp=fp, proxy=proxy, headless=headless, timeout=browser_timeout,
-                                   screenshot_path=screenshot_path)
-            if result.status and result.status < 400 and len(result.get_all_text()) >= MIN_CONTENT_LENGTH:
-                return result
-            _count_degradation("L5_fail_with_proxy")
-    else:
-        # 固定模式
-        for fetch_fn in fetch_funcs:
-            kwargs: Dict[str, Any] = {"url": url, "fp": fp}
-            if proxy_enabled and proxies[0] is not None:
-                kwargs["proxy"] = proxies[0]
-            if fetch_fn == fetch_browser:
-                browser_timeout = timeout * 1000 if timeout < 1000 else timeout
-                kwargs["timeout"] = browser_timeout
+            kwargs: Dict[str, Any] = {"url": url, "fp": fp, "proxy": proxy}
+            if is_browser:
                 kwargs["headless"] = headless
+                kwargs["timeout"] = timeout  # 已统一为秒
                 kwargs["screenshot_path"] = screenshot_path
             else:
-                kwargs["timeout"] = timeout
                 kwargs["method"] = method
                 kwargs["data"] = data
+                kwargs["timeout"] = timeout
             result = fetch_fn(**kwargs)
-            if result.status and result.status < 400:
+            if _is_success(result):
                 return result
+            _count_degradation(f"{level}_fail_{phase_label}")
+        return None
+
+    if mode == "auto":
+        # Phase 1: 无代理直连
+        result = _run_chain(proxy=None, phase_label="no_proxy")
+        if result is not None:
+            return result
+
+        # Phase 2: 加代理重试
+        real_proxies = [p for p in proxies if p is not None]
+        if real_proxies:
+            logger.info("[smart_fetch] 直连全部失败，启用代理重试...")
+            for proxy in real_proxies:
+                result = _run_chain(proxy=proxy, phase_label="with_proxy")
+                if result is not None:
+                    return result
+    else:
+        # 固定模式
+        mode_map: Dict[str, Any] = {
+            "tls": fetch_tls,
+            "http": fetch_http,
+            "stealth": fetch_stealth,
+            "browser": fetch_browser,
+        }
+        fetch_fn = mode_map.get(mode)
+        if fetch_fn is None:
+            logger.error("[smart_fetch] 未知模式: %s", mode)
+            return _BaseResponse(status=0)
+
+        kwargs: Dict[str, Any] = {"url": url, "fp": fp, "timeout": timeout}
+        is_browser = (fetch_fn is fetch_browser)
+        if is_browser:
+            kwargs["headless"] = headless
+            kwargs["screenshot_path"] = screenshot_path
+        else:
+            kwargs["method"] = method
+            kwargs["data"] = data
+        if proxy_enabled and real_proxies:
+            kwargs["proxy"] = real_proxies[0]
+        result = fetch_fn(**kwargs)
+        if _is_success(result):
+            return result
 
     logger.error("[smart_fetch] 所有层级均失败: %s", url)
     return _BaseResponse(status=0)
@@ -660,7 +633,14 @@ async def async_bulk_scrape(urls: List[str], max_concurrent: int = 5, **kwargs) 
 # CLI 参数解析
 # ============================================================
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    """解析命令行参数。"""
+    """解析命令行参数，配置文件作为默认值来源。"""
+    # 第一遍：仅提取 --config 路径，用于加载配置
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=None)
+    pre_args, _ = pre_parser.parse_known_args(argv)
+    config = load_config(pre_args.config)
+
+    # 第二遍：用配置值作为默认值
     parser = argparse.ArgumentParser(
         description="Aelura · 黑豹跳蛛 — 轻量化全功能网页抓取",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -668,12 +648,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("urls", nargs="*", help="要抓取的 URL（支持多个）")
     parser.add_argument("--url-file", help="从文件读取 URL 列表（每行一个）")
     parser.add_argument("--mode", choices=["auto", "tls", "http", "stealth", "browser"],
-                        default="auto", help="抓取模式（默认 auto）")
-    parser.add_argument("--output", choices=["json", "text", "html"], default="json",
+                        default=config.get("default_mode", DEFAULT_MODE),
+                        help="抓取模式（默认 auto）")
+    parser.add_argument("--output", choices=["json", "text", "html"],
+                        default=config.get("default_output", DEFAULT_OUTPUT),
                         help="输出格式（默认 json）")
-    parser.add_argument("--proxy", action="store_true", help="启用代理池")
-    parser.add_argument("--warmup", action="store_true", help="启用会话预热")
-    parser.add_argument("--timeout", type=float, default=15.0, help="请求超时（秒）")
+    parser.add_argument("--proxy", action="store_true",
+                        default=config.get("proxy", False),
+                        help="启用代理池")
+    parser.add_argument("--warmup", action="store_true",
+                        default=config.get("warmup", False),
+                        help="启用会话预热")
+    parser.add_argument("--timeout", type=float,
+                        default=config.get("timeout", 15.0),
+                        help="请求超时（秒）")
     parser.add_argument("--headless", action="store_true", default=True,
                         help="浏览器无头模式（默认开启）")
     parser.add_argument("--no-headless", dest="headless", action="store_false",
@@ -684,8 +672,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--data", help="POST 请求体数据")
     parser.add_argument("--config", help="配置文件路径（JSON 格式）")
     parser.add_argument("--cookies", help="Cookie 文件路径（JSON 格式）")
-    parser.add_argument("--max-concurrent", type=int, default=5,
+    parser.add_argument("--max-concurrent", type=int,
+                        default=config.get("max_concurrent", 5),
                         help="异步批量抓取最大并发数（默认 5）")
+    parser.add_argument("--respect-robots", action="store_true",
+                        default=config.get("respect_robots", False),
+                        help="遵守 robots.txt")
     parser.add_argument("--verbose", "-v", action="store_true", help="详细日志输出")
     return parser.parse_args(argv)
 
@@ -773,6 +765,7 @@ def scrape_single_url(url: str, args: argparse.Namespace,
 
 def format_results(results: List[Dict], output_format: str) -> str:
     """格式化抓取结果。"""
+    import html as html_module
     if output_format == "json":
         return json.dumps(results, ensure_ascii=False, indent=2)
     elif output_format == "text":
@@ -782,11 +775,14 @@ def format_results(results: List[Dict], output_format: str) -> str:
             parts.append(r["text"][:2000])
             parts.append("")
         return "\n".join(parts)
-    else:  # html
-        parts = []
+    else:  # html — 转义防止 XSS
+        parts = ["<html><head><meta charset='utf-8'></head><body>"]
         for r in results:
-            parts.append(f"<h2>{r['url']} (HTTP {r['status']})</h2>")
-            parts.append(f"<pre>{r['text'][:5000]}</pre>")
+            safe_url = html_module.escape(r["url"])
+            safe_text = html_module.escape(r["text"][:5000])
+            parts.append(f"<h2>{safe_url} (HTTP {r['status']})</h2>")
+            parts.append(f"<pre>{safe_text}</pre>")
+        parts.append("</body></html>")
         return "\n".join(parts)
 
 
@@ -804,9 +800,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-
-    # 加载配置
-    config = load_config(args.config)
 
     # 收集 URL
     urls = collect_urls(args)
@@ -846,9 +839,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if stats:
         logger.info("[降级统计] %s", stats)
 
-    # 清理浏览器实例
-    if _browser_manager:
-        _browser_manager.close()
+    # 浏览器清理由 atexit 自动处理，无需手动调用
 
 
 if __name__ == "__main__":
