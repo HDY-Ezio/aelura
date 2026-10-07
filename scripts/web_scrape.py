@@ -408,8 +408,8 @@ def fetch_browser(
     manager = _get_browser_manager()
     context = None
     page = None
-    # Playwright 使用毫秒，统一在此处转换
-    pw_timeout_ms = int(timeout * 1000) if timeout < 1000 else int(timeout)
+    # Playwright 使用毫秒，统一在此处转换（timeout 始终为秒）
+    pw_timeout_ms = int(timeout * 1000)
     try:
         context = manager.new_context(fp_args=fp, proxy=proxy, headless=headless)
         page = context.new_page()
@@ -477,7 +477,7 @@ def smart_fetch(
         proxy_enabled: 是否启用代理。
         warmup: 是否先进行会话预热（L4）。
         headless: 浏览器是否无头模式。
-        timeout: 请求超时（秒），浏览器模式为毫秒。
+        timeout: 请求超时，统一使用秒为单位。
         fp: 预生成的指纹。
         method: HTTP 方法（GET / POST）。
         data: POST 请求体。
@@ -503,14 +503,12 @@ def smart_fetch(
             logger.info("[smart_fetch] 注入 %d 个 Cookie", len(valid_cookies))
 
     # 代理池
-    proxies: List[Optional[str]] = [None]
     real_proxies: List[str] = []
     if proxy_enabled:
         proxy_list = get_available_proxies(limit=5)
         if proxy_list:
             real_proxies = proxy_list
-            proxies = proxy_list
-            logger.info("[smart_fetch] 代理池就绪，%d 个可用代理", len(proxies))
+            logger.info("[smart_fetch] 代理池就绪，%d 个可用代理", len(real_proxies))
 
     # auto 模式的降级链定义（声明式，便于扩展新层级）
     # 每项: (fetch_func, level_label, is_browser)
@@ -553,7 +551,6 @@ def smart_fetch(
             return result
 
         # Phase 2: 加代理重试
-        real_proxies = [p for p in proxies if p is not None]
         if real_proxies:
             logger.info("[smart_fetch] 直连全部失败，启用代理重试...")
             for proxy in real_proxies:
@@ -617,11 +614,15 @@ async def async_bulk_scrape(urls: List[str], max_concurrent: int = 5, **kwargs) 
 
     async def _fetch_one(url: str) -> Dict:
         async with semaphore:
+            start = time.time()
             result = await async_smart_fetch(url, **kwargs)
+            elapsed = time.time() - start
             return {
                 "url": url,
                 "status": result.status,
                 "text": result.get_all_text(),
+                "html_length": len(result.html_content),
+                "elapsed_seconds": round(elapsed, 2),
                 "success": bool(result.status and result.status < 400),
             }
 

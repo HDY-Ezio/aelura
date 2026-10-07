@@ -21,7 +21,7 @@ from typing import Dict, Optional, List, Tuple, Any
 from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
 
-from utils import validate_url as _validate_url, get_db
+from utils import validate_url as _validate_url, get_db, CACHE_TABLE_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -239,8 +239,8 @@ class PageCache:
     def _init_db(self) -> None:
         """初始化缓存数据库表。"""
         conn = get_db(self._db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS page_cache (
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {CACHE_TABLE_NAME} (
                 url TEXT PRIMARY KEY,
                 content_hash TEXT,
                 content TEXT,
@@ -258,7 +258,7 @@ class PageCache:
         """
         conn = get_db(self._db_path)
         cursor = conn.execute(
-            "SELECT content, headers, cached_at FROM page_cache WHERE url=?",
+            f"SELECT content, headers, cached_at FROM {CACHE_TABLE_NAME} WHERE url=?",
             (url,),
         )
         row = cursor.fetchone()
@@ -271,7 +271,7 @@ class PageCache:
             except ValueError:
                 pass
             # 过期，清理
-            conn.execute("DELETE FROM page_cache WHERE url=?", (url,))
+            conn.execute(f"DELETE FROM {CACHE_TABLE_NAME} WHERE url=?", (url,))
             conn.commit()
         return None
 
@@ -282,7 +282,7 @@ class PageCache:
         conn = get_db(self._db_path)
         # 去重检查：相同哈希不重复存储
         cursor = conn.execute(
-            "SELECT content_hash FROM page_cache WHERE url=?",
+            f"SELECT content_hash FROM {CACHE_TABLE_NAME} WHERE url=?",
             (url,),
         )
         existing = cursor.fetchone()
@@ -291,7 +291,7 @@ class PageCache:
             return
 
         conn.execute(
-            "INSERT OR REPLACE INTO page_cache (url, content_hash, content, headers) "
+            f"INSERT OR REPLACE INTO {CACHE_TABLE_NAME} (url, content_hash, content, headers) "
             "VALUES (?, ?, ?, ?)",
             (url, content_hash, content, headers),
         )
@@ -302,7 +302,7 @@ class PageCache:
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         conn = get_db(self._db_path)
         cursor = conn.execute(
-            "SELECT content_hash FROM page_cache WHERE content_hash=?",
+            f"SELECT content_hash FROM {CACHE_TABLE_NAME} WHERE content_hash=?",
             (content_hash,),
         )
         return cursor.fetchone() is not None
@@ -311,7 +311,7 @@ class PageCache:
         """清理过期缓存，返回清理数量。"""
         conn = get_db(self._db_path)
         cutoff = (datetime.now() - timedelta(hours=self._ttl_hours)).strftime("%Y-%m-%d %H:%M:%S")
-        cursor = conn.execute("DELETE FROM page_cache WHERE cached_at < ?", (cutoff,))
+        cursor = conn.execute(f"DELETE FROM {CACHE_TABLE_NAME} WHERE cached_at < ?", (cutoff,))
         conn.commit()
         return cursor.rowcount
 

@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 MIN_CONTENT_LENGTH: int = 100  # 内容有效性的最低字符长度
 VALID_SCHEMES: set = {"http", "https"}
+DEFAULT_MODE: str = "auto"
+DEFAULT_OUTPUT: str = "json"
 
 # SQLite 表名常量（消除魔法字符串）
 PROXY_TABLE_NAME: str = "proxies"
