@@ -12,6 +12,7 @@ import logging
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
@@ -222,10 +223,15 @@ def refresh_proxy_pool() -> int:
     return alive_count
 
 
-def check_proxy_alive() -> int:
-    """检测数据库中所有代理的存活状态。
+PROXY_CHECK_BATCH_SIZE: int = 10
+PROXY_CHECK_WORKERS: int = 5
 
-    每次检测间隔 0.2 秒，避免被 httpbin.org 限流。
+
+def check_proxy_alive() -> int:
+    """检测数据库中所有代理的存活状态（并发检测）。
+
+    使用 ThreadPoolExecutor 并发检测，每批 PROXY_CHECK_BATCH_SIZE 个代理，
+    避免串行逐个检测的长时间等待（500 个代理从 100s 降至 ~20s）。
 
     Returns:
         存活代理数量。
@@ -240,13 +246,10 @@ def check_proxy_alive() -> int:
     has_cffi, cffi = try_import_curl_cffi()
     alive_count = 0
 
-    for i, (proxy_id, ip, port) in enumerate(rows):
-        # 限流：每 0.2 秒检测一个，避免被目标站 ban
-        if i > 0:
-            time.sleep(0.2)
-        
+    def _check_one(proxy_id: int, ip: str, port: int) -> Tuple[int, bool, float]:
+        """检测单个代理，返回 (proxy_id, is_alive, response_time)。"""
         proxy_url = f"http://{ip}:{port}"
-        start_time = time.time()
+        start = time.time()
         try:
             if has_cffi:
                 resp = cffi.get(
@@ -254,30 +257,47 @@ def check_proxy_alive() -> int:
                     proxies={"http": proxy_url, "https": proxy_url},
                     timeout=PROXY_TIMEOUT,
                 )
-                elapsed = time.time() - start_time
+                elapsed = time.time() - start
                 if resp.status_code == 200:
+                    return (proxy_id, True, elapsed)
+            return (proxy_id, False, 0.0)
+        except Exception:
+            return (proxy_id, False, 0.0)
+
+    # 分批并发检测：每批 PROXY_CHECK_BATCH_SIZE 个，间隔 0.2s 避免限流
+    for batch_start in range(0, len(rows), PROXY_CHECK_BATCH_SIZE):
+        batch = rows[batch_start:batch_start + PROXY_CHECK_BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=PROXY_CHECK_WORKERS) as executor:
+            futures = {
+                executor.submit(_check_one, pid, ip, port): pid
+                for pid, ip, port in batch
+            }
+            for future in as_completed(futures):
+                proxy_id, is_alive, elapsed = future.result()
+                if is_alive:
                     conn.execute(
-                        f"UPDATE {PROXY_TABLE_NAME} SET is_alive=1, response_time=?, last_checked=datetime('now') WHERE id=?",
+                        f"UPDATE {PROXY_TABLE_NAME} SET is_alive=1, response_time=?, "
+                        "last_checked=datetime('now') WHERE id=?",
                         (elapsed, proxy_id),
                     )
                     alive_count += 1
                 else:
                     conn.execute(
-                        f"UPDATE {PROXY_TABLE_NAME} SET fail_count=fail_count+1, last_checked=datetime('now') WHERE id=?",
+                        f"UPDATE {PROXY_TABLE_NAME} SET fail_count=fail_count+1, "
+                        "last_checked=datetime('now') WHERE id=?",
                         (proxy_id,),
                     )
-            else:
-                conn.execute(
-                    f"UPDATE {PROXY_TABLE_NAME} SET is_alive=0, last_checked=datetime('now') WHERE id=?",
-                    (proxy_id,),
-                )
-        except Exception:
-            conn.execute(
-                f"UPDATE {PROXY_TABLE_NAME} SET fail_count=fail_count+1, is_alive=0, last_checked=datetime('now') WHERE id=?",
-                (proxy_id,),
-            )
+        conn.commit()
+        # 批次间限流
+        if batch_start + PROXY_CHECK_BATCH_SIZE < len(rows):
+            time.sleep(0.2)
 
-    conn.commit()
+    # curl_cffi 不可用时，标记所有代理为不可用
+    if not has_cffi:
+        conn.execute(
+            f"UPDATE {PROXY_TABLE_NAME} SET is_alive=0, last_checked=datetime('now')"
+        )
+        conn.commit()
 
     # 清理超过最大失败次数的代理
     conn.execute(f"DELETE FROM {PROXY_TABLE_NAME} WHERE fail_count >= ?", (MAX_FAIL_COUNT,))

@@ -193,9 +193,9 @@ _db_initialized: set = set()  # 追踪已初始化的数据库
 
 
 def get_db(db_path) -> Any:
-    """获取或复用 SQLite 连接。
+    """获取或复用 SQLite 连接（WAL 模式，读写并发不互斥）。
 
-    避免频繁开关连接，同一 db_path 始终返回同一个连接对象。
+    同一 db_path 始终返回同一个连接对象。启用 WAL 模式解决并发写锁瓶颈。
 
     Args:
         db_path: 数据库文件路径。
@@ -208,7 +208,13 @@ def get_db(db_path) -> Any:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         import sqlite3
         try:
-            _db_connections[path_str] = sqlite3.connect(str(db_path))
+            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            # 性能优化：WAL 模式允许读写并发，synchronous=NORMAL 减少 fsync
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-8000")  # 8MB 页缓存
+            conn.execute("PRAGMA temp_store=MEMORY")
+            _db_connections[path_str] = conn
         except sqlite3.Error as e:
             logger.error("[DB] 连接失败 %s: %s", db_path, e)
             raise

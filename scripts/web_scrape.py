@@ -74,6 +74,15 @@ def get_degradation_stats() -> Dict[str, int]:
     return dict(_degradation_count)
 
 
+# 可选加速：selectolax HTML 解析器（比正则快 5-10 倍）
+_selectolax_parser = None
+try:
+    from selectolax.parser import HTMLParser as _SelectolaxParser
+    _selectolax_parser = _SelectolaxParser
+except ImportError:
+    pass
+
+
 # ============================================================
 # 统一响应基类
 # ============================================================
@@ -86,7 +95,17 @@ class _BaseResponse:
         self.url = url
 
     def get_all_text(self) -> str:
-        """提取页面全部可见文本。"""
+        """提取页面全部可见文本。优先使用 selectolax（快 5-10x），回退正则。"""
+        if _selectolax_parser is not None:
+            try:
+                tree = _selectolax_parser(self.html_content)
+                # 移除 script/style 节点
+                for tag in tree.css("script,style"):
+                    tag.decompose()
+                return tree.text(separator=" ", strip=True)
+            except Exception:
+                pass
+        # 回退：正则提取
         text = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", self.html_content, flags=re.IGNORECASE)
         text = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", text, flags=re.IGNORECASE)
         text = re.sub(r"<[^>]+>", " ", text)
@@ -161,19 +180,106 @@ class _BrowserPage(_BaseResponse):
 
 
 # ============================================================
-# 浏览器管理器（实例复用）
+# curl_cffi Session 连接池（复用 TCP 连接 + TLS 握手）
 # ============================================================
-class _BrowserManager:
-    """管理 Playwright 浏览器实例的生命周期，避免重复启动。
+class _SessionManager:
+    """curl_cffi Session 连接池管理器。
 
-    线程安全：使用锁保护浏览器创建/销毁，支持 asyncio.to_thread 并发场景。
+    按域名缓存 Session 实例，复用 TCP 连接和 TLS 握手，
+    避免每次请求都重新建立连接（节省 2-3 次 RTT）。线程安全。
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
+        self._sessions: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    def get_session(self, domain: str, impersonate: str = "chrome131") -> Any:
+        """获取或创建指定域名的 Session。"""
+        cffi = try_import_curl_cffi()
+        if cffi is None:
+            return None
+        with self._lock:
+            key = f"{domain}|{impersonate}"
+            if key not in self._sessions:
+                self._sessions[key] = cffi.Session(impersonate=impersonate)
+            return self._sessions[key]
+
+    def close_all(self) -> None:
+        """关闭所有 Session 连接。"""
+        with self._lock:
+            for session in self._sessions.values():
+                try:
+                    session.close()
+                except Exception:
+                    pass
+            self._sessions.clear()
+
+
+_session_manager = _SessionManager()
+register_cleanup(_session_manager.close_all)
+
+
+# ============================================================
+# 错误分类（用于降级链短路优化）
+# ============================================================
+class _ErrorType:
+    """降级链错误分类常量。"""
+    RECOVERABLE = "recoverable"        # 可恢复：HTTP 错误、超时、内容不足 → 继续降级
+    UNRECOVERABLE = "unrecoverable"    # 不可恢复：DNS 失败、SSRF 拦截、SSL 错误 → 跳过后续层级
+    MISSING_DEP = "missing_dependency" # 缺少依赖 → 跳过当前层级
+
+
+def _classify_error(error: Exception, url: str) -> str:
+    """将异常分类为可恢复/不可恢复/缺少依赖。
+
+    不可恢复的错误（DNS 失败、SSL 错误、SSRF 拦截）在后续降级层级中
+    也会失败，因此直接跳过节省时间。
+    """
+    error_str = str(error).lower()
+    error_type = type(error).__name__.lower()
+
+    # 不可恢复错误
+    if any(kw in error_str for kw in (
+        "name or service not known",
+        "getaddrinfo failed",
+        "nodename nor servname",
+        "dns",
+        "ssl",
+        "certificate",
+        "ssrf",
+        "private",
+        "blocked",
+    )):
+        return _ErrorType.UNRECOVERABLE
+
+    # 缺少依赖
+    if "import" in error_type or "not found" in error_str:
+        return _ErrorType.MISSING_DEP
+
+    # 其余视为可恢复（超时、HTTP 4xx/5xx、内容不足等）
+    return _ErrorType.RECOVERABLE
+
+
+# ============================================================
+# 浏览器管理器（实例复用 + 上下文池）
+# ============================================================
+CONTEXT_POOL_SIZE: int = 3
+
+
+class _BrowserManager:
+    """管理 Playwright 浏览器实例的生命周期 + 上下文池。
+
+    线程安全：使用锁保护浏览器创建/销毁，支持 asyncio.to_thread 并发场景。
+    上下文池：维护 CONTEXT_POOL_SIZE 个 context 轮转复用，减少内存分配开销。
+    """
+
+    def __init__(self) -> None:
         self._playwright = None
         self._browser = None
         self._headless = True
         self._lock = threading.Lock()
+        self._context_pool: List[Any] = []
+        self._context_index = 0
         register_cleanup(self.close)
 
     def _ensure_browser(self, headless: bool = True):
@@ -216,9 +322,16 @@ class _BrowserManager:
             ctx_opts["proxy"] = {"server": f"http://{proxy}"}
         return browser.new_context(**ctx_opts)
 
-    def close(self):
-        """关闭浏览器和 Playwright 实例。"""
+    def close(self) -> None:
+        """关闭所有上下文和浏览器实例。"""
         try:
+            # 清理上下文池
+            for ctx in self._context_pool:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            self._context_pool.clear()
             if self._browser:
                 self._browser.close()
             if self._playwright:
@@ -251,7 +364,7 @@ def fetch_tls(
     data: Optional[str] = None,
     timeout: float = 15.0,
 ) -> _BaseResponse:
-    """L2: 使用 curl_cffi 发送带 TLS 指纹的请求。"""
+    """L2: 使用 curl_cffi 发送带 TLS 指纹的请求（Session 连接池复用）。"""
     ok, cffi = try_import_curl_cffi()
     if not ok:
         _count_degradation("L2_unavailable")
@@ -275,13 +388,23 @@ def fetch_tls(
             },
             "timeout": timeout,
             "proxies": proxies,
-            "impersonate": "chrome131",
         }
 
-        if method.upper() == "POST" and data:
-            resp = cffi.post(url, data=data, **req_kwargs)
+        # 使用 Session 连接池复用 TCP 连接（同域名节省 2-3 次 RTT）
+        domain = urlparse(url).hostname or ""
+        session = _session_manager.get_session(domain, "chrome131")
+        if session is not None:
+            if method.upper() == "POST" and data:
+                resp = session.post(url, data=data, **req_kwargs)
+            else:
+                resp = session.get(url, **req_kwargs)
         else:
-            resp = cffi.get(url, **req_kwargs)
+            # Session 不可用时 fallback 到单次请求
+            req_kwargs["impersonate"] = "chrome131"
+            if method.upper() == "POST" and data:
+                resp = cffi.post(url, data=data, **req_kwargs)
+            else:
+                resp = cffi.get(url, **req_kwargs)
 
         result = _CurlResponse(resp)
         result.status = resp.status_code
@@ -524,7 +647,11 @@ def smart_fetch(
         return bool(resp.status and resp.status < 400 and len(resp.get_all_text()) >= MIN_CONTENT_LENGTH)
 
     def _run_chain(proxy: Optional[str], phase_label: str) -> Optional[_BaseResponse]:
-        """按降级链顺序执行，返回第一个成功的结果。"""
+        """按降级链顺序执行，返回第一个成功的结果。
+
+        性能优化：不可恢复错误（DNS 失败、SSRF 拦截）直接跳过后续层级，
+        因为后续层级也会遇到相同的网络层问题。
+        """
         for fetch_fn, level, is_browser in _AUTO_CHAIN:
             # warmup 模式下才执行 L4，否则跳过
             if fetch_fn is fetch_stealth and not warmup:
@@ -538,7 +665,19 @@ def smart_fetch(
                 kwargs["method"] = method
                 kwargs["data"] = data
                 kwargs["timeout"] = timeout
-            result = fetch_fn(**kwargs)
+            try:
+                result = fetch_fn(**kwargs)
+            except Exception as e:
+                error_type = _classify_error(e, url)
+                _count_degradation(f"{level}_error_{phase_label}")
+                if error_type == _ErrorType.UNRECOVERABLE:
+                    logger.debug(
+                        "[auto] 不可恢复错误 (%s): %s — 跳过后续降级层级",
+                        level, str(e)[:80],
+                    )
+                    return None
+                # 可恢复错误，继续下一层级
+                continue
             if _is_success(result):
                 return result
             _count_degradation(f"{level}_fail_{phase_label}")

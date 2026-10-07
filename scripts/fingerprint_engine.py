@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import threading
 import time
 from typing import Optional, Dict, List, Tuple
 
@@ -182,9 +183,50 @@ class FingerprintEngine:
 
 
 # ============================================================
-# 模块级便捷接口
+# 模块级便捷接口 + 指纹池（O(1) 轮转，避免每次请求重新生成）
 # ============================================================
 _default_engine = None
+_fp_pool: Optional["FingerprintPool"] = None
+_fp_pool_lock = threading.Lock()
+
+DEFAULT_POOL_SIZE: int = 50
+
+
+class FingerprintPool:
+    """预生成指纹池。
+
+    批量抓取场景下避免每次请求都重新计算指纹（SHA-256 去重 + 随机选择），
+    改为 O(1) 轮转取用。线程安全。
+    """
+
+    def __init__(self, pool_size: int = DEFAULT_POOL_SIZE, seed: Optional[int] = None):
+        self._pool: List[dict] = []
+        self._index = 0
+        self._lock = threading.Lock()
+        engine = FingerprintEngine(seed=seed)
+        for _ in range(pool_size):
+            self._pool.append(engine.generate())
+
+    def next(self) -> dict:
+        """轮转取下一个指纹，线程安全。"""
+        with self._lock:
+            fp = self._pool[self._index % len(self._pool)]
+            self._index += 1
+            return fp
+
+    @property
+    def size(self) -> int:
+        return len(self._pool)
+
+
+def get_fingerprint_pool(pool_size: int = DEFAULT_POOL_SIZE) -> FingerprintPool:
+    """获取全局指纹池（懒初始化单例）。"""
+    global _fp_pool
+    if _fp_pool is None:
+        with _fp_pool_lock:
+            if _fp_pool is None:
+                _fp_pool = FingerprintPool(pool_size=pool_size)
+    return _fp_pool
 
 
 def get_engine(seed: Optional[int] = None) -> FingerprintEngine:
