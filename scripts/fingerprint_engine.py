@@ -1,208 +1,198 @@
 #!/usr/bin/env python3
 """
-指纹轮换引擎 - 纯Python，零外部API
-生成随机浏览器指纹，每次请求用不同的身份
-覆盖：UA、屏幕分辨率、语言、时区、Canvas指纹、WebGL、平台
+Aelura 指纹轮换引擎
+生成真实浏览器指纹（UA / 屏幕 / 时区 / 语言 / 硬件参数），
+并按地理区域保持一致性，避免被反爬系统识别为机器人。
+
+v2.0: 递归改迭代，消除栈溢出风险；魔法数字常量化。
 """
 
+from __future__ import annotations
+
+import hashlib
 import random
 import time
+from typing import Optional, Dict, List, Tuple
 
 # ============================================================
-# 指纹池（50+ 真实组合）
+# 常量
 # ============================================================
+MAX_UNIQUE_FINGERPRINTS: int = 200   # 去重池大小上限
+SCREEN_RESOLUTIONS: List[str] = [
+    "1920x1080", "2560x1440", "1366x768", "1536x864",
+    "1440x900", "1280x720", "3840x2160",
+    "360x740", "390x844", "412x915",   # 移动端
+    "428x926", "393x873", "375x812", "375x667",
+    "414x896", "320x568",
+]
 
-USER_AGENTS = [
+VIEWPORT_MAP: Dict[str, Tuple[int, int]] = {
+    "1920x1080": (1920, 969),
+    "2560x1440": (2560, 1369),
+    "1366x768":  (1366, 728),
+    "1536x864":  (1536, 824),
+    "1440x900":  (1440, 861),
+    "1280x720":  (1280, 651),
+    "3840x2160": (3840, 2089),
+    "360x740":   (360, 740),
+    "390x844":   (390, 844),
+    "412x915":   (412, 915),
+    "428x926":   (428, 926),
+    "393x873":   (393, 873),
+    "375x812":   (375, 812),
+    "375x667":   (375, 667),
+    "414x896":   (414, 896),
+    "320x568":   (320, 568),
+}
+
+# 地理一致性配置：(时区, 语言, 平台关键词)
+GEO_PROFILES: List[Tuple[str, str, List[str]]] = [
+    ("Asia/Shanghai",    "zh-CN", ["Win", "Android"]),
+    ("America/New_York", "en-US", ["Win", "Mac", "iPhone"]),
+    ("Europe/London",    "en-GB", ["Win", "Mac", "Linux"]),
+    ("Asia/Tokyo",       "ja-JP", ["Win", "Android"]),
+    ("Europe/Berlin",    "de-DE", ["Win", "Linux"]),
+    ("America/Los_Angeles", "en-US", ["Mac", "iPhone", "Win"]),
+    ("Asia/Kolkata",     "en-IN", ["Android", "Win"]),
+    ("Australia/Sydney", "en-AU", ["Win", "Mac"]),
+]
+
+USER_AGENTS: List[str] = [
     # Chrome Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     # Chrome macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 12_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     # Chrome Android
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-A546B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36",
     # Firefox
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.0; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
     # Edge
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    # iPhone Safari
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
 ]
-
-# 地理一致性配置：(时区, 语言, 平台)
-GEO_PROFILES = [
-    ("Asia/Shanghai", "zh-CN,zh;q=0.9,en;q=0.8", "Win32"),
-    ("Asia/Shanghai", "zh-CN,zh;q=0.9", "Win32"),
-    ("Asia/Hong_Kong", "zh-TW,zh;q=0.9,en;q=0.8", "Win32"),
-    ("America/New_York", "en-US,en;q=0.9", "Win32"),
-    ("America/Los_Angeles", "en-US,en;q=0.9", "MacIntel"),
-    ("Europe/London", "en-GB,en;q=0.9", "Win32"),
-    ("Europe/Berlin", "de-DE,de;q=0.9,en;q=0.8", "Win32"),
-    ("Asia/Tokyo", "ja-JP,ja;q=0.9,en;q=0.8", "Win32"),
-]
-
-SCREEN_RESOLUTIONS = [
-    (1920, 1080), (1920, 1200), (2560, 1440), (3840, 2160),
-    (1366, 768), (1440, 900), (1536, 864), (1680, 1050),
-    (1280, 720), (1280, 800), (1600, 900), (2560, 1600),
-    # 移动端
-    (390, 844), (375, 812), (414, 896), (360, 800), (412, 915),
-]
-
-VIEWPORT_SIZES = [
-    (1920, 1080), (1366, 768), (1536, 864), (1440, 900),
-    (1280, 720), (2560, 1440), (1600, 900),
-    (390, 844), (375, 812), (414, 896),
-]
-
-HARDWARE_CONCURRENCY = [4, 8, 12, 16]
-DEVICE_MEMORY = [4, 8, 16]
-MAX_TOUCH_POINTS = [0, 5]  # 0=桌面, 5=触屏
 
 
 class FingerprintEngine:
-    """指纹生成引擎 - 每次生成一个完整且一致的浏览器指纹"""
+    """
+    指纹轮换引擎。
+    - 地理一致性：UA、时区、语言、平台互相匹配
+    - 去重：同一会话内不重复使用指纹（直到池满）
+    """
 
-    def __init__(self):
-        self._used = set()
-        self._max_unique = 200  # 最多200个不重复指纹后重置
+    def __init__(self, seed: Optional[int] = None):
+        self._rng = random.Random(seed)
+        self._used: set = set()
+        self._max_unique: int = MAX_UNIQUE_FINGERPRINTS
+
+    def _pick_geo_profile(self) -> Tuple[str, str, List[str]]:
+        """选择一个地理配置。"""
+        return self._rng.choice(GEO_PROFILES)
+
+    def _match_ua(self, platform_keywords: List[str]) -> str:
+        """根据平台关键词筛选匹配的 UA。"""
+        matched = [ua for ua in USER_AGENTS if any(kw in ua for kw in platform_keywords)]
+        if not matched:
+            return self._rng.choice(USER_AGENTS)
+        return self._rng.choice(matched)
+
+    def _pick_screen(self, ua: str) -> str:
+        """根据 UA 选择合适的屏幕分辨率（移动端 vs 桌面端）。"""
+        is_mobile = "Mobile" in ua or "Android" in ua or "iPhone" in ua
+        if is_mobile:
+            mobile_screens = [r for r in SCREEN_RESOLUTIONS if "x" in r and int(r.split("x")[0]) < 500]
+            return self._rng.choice(mobile_screens) if mobile_screens else self._rng.choice(SCREEN_RESOLUTIONS)
+        else:
+            desktop_screens = [r for r in SCREEN_RESOLUTIONS if "x" in r and int(r.split("x")[0]) >= 1000]
+            return self._rng.choice(desktop_screens) if desktop_screens else self._rng.choice(SCREEN_RESOLUTIONS)
 
     def generate(self) -> dict:
-        """生成一个完整的浏览器指纹"""
-        # 地理一致性：时区/语言/平台必须匹配
-        geo = random.choice(GEO_PROFILES)
-        timezone, language, platform = geo
+        """生成一套完整的浏览器指纹（迭代方式，避免递归栈溢出）。"""
+        max_attempts = self._max_unique * 2
 
-        # 根据平台筛选UA
-        if platform == "MacIntel":
-            pool = [ua for ua in USER_AGENTS if "Macintosh" in ua]
-        elif platform == "Linux":
-            pool = [ua for ua in USER_AGENTS if "Linux" in ua]
-        else:
-            pool = [ua for ua in USER_AGENTS
-                    if "Linux" not in ua and "Macintosh" not in ua]
+        for _ in range(max_attempts):
+            timezone, language, platforms = self._pick_geo_profile()
+            ua = self._match_ua(platforms)
+            screen = self._pick_screen(ua)
+            w, h = VIEWPORT_MAP.get(screen, (1920, 1080))
 
-        if not pool:
-            pool = USER_AGENTS
+            fingerprint = {
+                "user_agent": ua,
+                "viewport": {"width": w, "height": h},
+                "screen": {"width": int(screen.split("x")[0]), "height": int(screen.split("x")[1])},
+                "timezone": timezone,
+                "locale": language,
+                "platform": "Win32" if "Win" in ua else ("MacIntel" if "Mac" in ua else ("Linux" if "X11" in ua else "")),
+                "hardware_concurrency": self._rng.choice([2, 4, 6, 8, 12, 16]),
+                "device_memory": self._rng.choice([2, 4, 8, 16, 32]),
+                "color_depth": self._rng.choice([24, 32]),
+                "color_scheme": self._rng.choice(["light", "light", "light", "dark"]),
+            }
 
-        ua = random.choice(pool)
+            # 去重 key
+            fp_key = hashlib.md5(str(sorted(fingerprint.items())).encode()).hexdigest()
 
-        # 屏幕
-        screen_w, screen_h = random.choice(SCREEN_RESOLUTIONS)
-        viewport_w, viewport_h = random.choice(VIEWPORT_SIZES)
+            if fp_key not in self._used or len(self._used) >= self._max_unique:
+                if len(self._used) >= self._max_unique:
+                    self._used.clear()
+                self._used.add(fp_key)
+                return fingerprint
 
-        # 确保viewport不超过screen
-        if viewport_w > screen_w:
-            viewport_w = screen_w
-        if viewport_h > screen_h:
-            viewport_h = screen_h
-
-        # 硬件
-        hw_cores = random.choice(HARDWARE_CONCURRENCY)
-        device_mem = random.choice(DEVICE_MEMORY)
-        touch_points = random.choice(MAX_TOUCH_POINTS)
-
-        # Canvas噪声（模拟不同GPU的渲染差异）
-        canvas_noise = round(random.uniform(-0.001, 0.001), 6)
-
-        # WebGL噪声
-        webgl_noise = round(random.uniform(-0.002, 0.002), 6)
-
-        fingerprint = {
-            "user_agent": ua,
-            "platform": platform,
-            "timezone": timezone,
-            "language": language,
-            "screen": {"width": screen_w, "height": screen_h},
-            "viewport": {"width": viewport_w, "height": viewport_h},
-            "hardware": {
-                "cores": hw_cores,
-                "memory": device_mem,
-                "touch_points": touch_points,
-            },
-            "canvas_noise": canvas_noise,
-            "webgl_noise": webgl_noise,
-            "color_depth": random.choice([24, 30]),
-            "pixel_ratio": random.choice([1, 1.25, 1.5, 2]),
-            "do_not_track": random.choice(
-                ["null", "null", "null", "1"]
-            ),  # 75%不启用DNT
-        }
-
-        # 去重
-        fp_key = hash(
-            fingerprint["user_agent"]
-            + fingerprint["timezone"]
-            + str(fingerprint["screen"])
-        )
-        if fp_key in self._used and len(self._used) < self._max_unique:
-            return self.generate()
-        self._used.add(fp_key)
-
+        # 兜底：超出最大尝试次数，返回最后一次生成的指纹（允许重复）
         return fingerprint
 
     def generate_playwright_args(self) -> dict:
-        """生成Playwright启动参数"""
+        """生成适用于 Playwright launch / context 的指纹参数。"""
         fp = self.generate()
         return {
             "user_agent": fp["user_agent"],
             "viewport": fp["viewport"],
-            "locale": fp["language"].split(",")[0],
-            "timezone_id": fp["timezone"],
             "screen": fp["screen"],
-            "device_scale_factor": fp.get("device_scale_factor", 1),
-            "color_scheme": random.choice(
-                ["light", "light", "light", "dark"]
-            ),  # 75%浅色
+            "locale": fp["locale"],
+            "timezone_id": fp["timezone"],
+            "device_scale_factor": self._rng.uniform(1.0, 3.0),
+            "color_scheme": fp["color_scheme"],
         }
 
-    def generate_curl_cffi_kwargs(self) -> dict:
-        """生成curl_cffi请求参数"""
+    def generate_curl_cfi_kwargs(self) -> dict:
+        """生成适用于 curl_cffi 的请求参数。"""
         fp = self.generate()
         return {
-            "impersonate": random.choice(
-                ["chrome120", "chrome131", "chrome124"]
-            ),
             "headers": {
                 "User-Agent": fp["user_agent"],
-                "Accept-Language": fp["language"],
-                "Accept": (
-                    "text/html,application/xhtml+xml,"
-                    "application/xml;q=0.9,image/webp,*/*;q=0.8"
-                ),
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": fp["do_not_track"],
+                "Accept-Language": f'{fp["locale"]},{fp["locale"].split("-")[0]};q=0.9',
             },
+            "timeout": 15,
         }
 
-    def stats(self) -> dict:
-        """返回使用统计"""
-        return {
-            "used_count": len(self._used),
-            "max_unique": self._max_unique,
-        }
 
-    def reset(self):
-        """重置指纹池"""
-        self._used.clear()
+# ============================================================
+# 模块级便捷接口
+# ============================================================
+_default_engine = None
+
+
+def get_engine(seed: Optional[int] = None) -> FingerprintEngine:
+    """获取默认指纹引擎（单例模式）。"""
+    global _default_engine
+    if _default_engine is None:
+        _default_engine = FingerprintEngine(seed=seed)
+    return _default_engine
+
+
+def generate_fingerprint() -> dict:
+    """快速生成一套指纹。"""
+    return get_engine().generate()

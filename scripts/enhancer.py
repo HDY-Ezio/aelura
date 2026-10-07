@@ -1,369 +1,412 @@
 #!/usr/bin/env python3
 """
-爬虫增强模块 - 域名限速/增量抓取/智能重试/Sitemap/缓存/robots.txt
-纯Python，零外部API
+Aelura 增强模块
+提供域名限速、增量抓取（ETag/Last-Modified）、智能重试、Sitemap 递归发现、
+内容缓存去重、robots.txt 合规等增强功能。
+
+v2.0: SQLite 连接复用、SSRF 防护集成、类型注解统一。
 """
 
+from __future__ import annotations
+
 import hashlib
-import json
 import logging
 import random
 import re
 import sqlite3
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import Dict, Optional, List, Tuple, Any
+from urllib.parse import urlparse, urljoin
 from urllib.robotparser import RobotFileParser
+
+from utils import validate_url as _validate_url, get_db
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 1. 域名级限速
+# 常量
+# ============================================================
+CACHE_DB_PATH: str = "./.aelura_cache.db"
+CACHE_TTL_HOURS: int = 24
+MAX_SITEMAP_DEPTH: int = 3
+SITEMAP_RETRY_ATTEMPTS: int = 3
+RATE_LIMIT_MIN_INTERVAL: float = 5.0   # 域名限速最小间隔（秒）
+RATE_LIMIT_MAX_INTERVAL: float = 30.0  # 域名限速最大间隔（秒）
+SITEMAP_DELAY: float = 1.0             # sitemap 抓取间隔（秒）
+
+
+# ============================================================
+# 域名限速器
 # ============================================================
 class DomainRateLimiter:
-    """每个域名独立限速"""
-    
-    def __init__(self, min_interval=5.0, max_interval=30.0):
-        self.min_interval = min_interval
-        self.max_interval = max_interval
-        self._last_request = {}  # {domain: timestamp}
-    
-    def wait_if_needed(self, url):
-        """如果需要等待则等待"""
+    """每个域名独立的请求限速器。"""
+
+    def __init__(self):
+        self._last_request_time: Dict[str, float] = {}
+
+    def wait(self, url: str) -> None:
+        """根据域名等待合适的时间间隔。"""
         domain = urlparse(url).netloc
         now = time.time()
-        last = self._last_request.get(domain, 0)
-        elapsed = now - last
-        
-        # 基础间隔 + 随机抖动
-        interval = random.uniform(self.min_interval, self.max_interval)
-        
-        if elapsed < interval:
-            wait = interval - elapsed
-            time.sleep(wait)
-        
-        self._last_request[domain] = time.time()
-    
-    def stats(self):
-        """返回各域名最后请求时间统计"""
-        return {
-            d: f"{time.time() - t:.1f}s ago"
-            for d, t in self._last_request.items()
+        if domain in self._last_request_time:
+            elapsed = now - self._last_request_time[domain]
+            required = random.uniform(RATE_LIMIT_MIN_INTERVAL, RATE_LIMIT_MAX_INTERVAL)
+            if elapsed < required:
+                wait_time = required - elapsed
+                logger.debug("[RateLimiter] 域名 %s 限速等待 %.1fs", domain, wait_time)
+                time.sleep(wait_time)
+        self._last_request_time[domain] = time.time()
+
+
+# ============================================================
+# 增量抓取（ETag / Last-Modified）
+# ============================================================
+def check_page_changed(url: str, headers: Optional[Dict] = None) -> Tuple[bool, Optional[Dict]]:
+    """通过条件请求检查页面是否有更新。
+
+    Args:
+        url: 目标 URL。
+        headers: 已保存的 ETag / Last-Modified 头。
+
+    Returns:
+        (是否已更新, 新的 etag/last_modified 字典)
+    """
+    # SSRF 校验
+    err = _validate_url(url)
+    if err:
+        logger.warning("[Enhancer] URL 校验失败: %s", err)
+        return True, None
+
+    try:
+        import requests
+        conditional_headers = {}
+        if headers:
+            if "ETag" in headers:
+                conditional_headers["If-None-Match"] = headers["ETag"]
+            if "Last-Modified" in headers:
+                conditional_headers["If-Modified-Since"] = headers["Last-Modified"]
+
+        resp = requests.head(url, headers=conditional_headers, timeout=10, allow_redirects=True)
+        new_headers = {
+            "ETag": resp.headers.get("ETag"),
+            "Last-Modified": resp.headers.get("Last-Modified"),
         }
-
-
-# ============================================================
-# 2. 增量抓取（ETag / Last-Modified）
-# ============================================================
-def check_page_changed(url, cached_etag=None, cached_last_modified=None) -> dict:
-    """
-    检查页面是否有更新
-    返回: {"changed": bool, "etag": str|None, "last_modified": str|None}
-    """
-    ok, cffi = False, None
-    try:
-        from curl_cffi import requests as cffi_requests
-        cffi = cffi_requests
-        ok = True
-    except ImportError:
-        pass
-    
-    if not ok:
-        return {"changed": True, "etag": None, "last_modified": None}
-    
-    try:
-        headers = {}
-        if cached_etag:
-            headers["If-None-Match"] = cached_etag
-        if cached_last_modified:
-            headers["If-Modified-Since"] = cached_last_modified
-        
-        resp = cffi.get(url, impersonate="chrome120", timeout=10, headers=headers)
-        
-        # 304 = 没变
         if resp.status_code == 304:
-            return {"changed": False, "etag": cached_etag,
-                    "last_modified": cached_last_modified}
-        
-        # 200 = 有更新
-        if resp.status_code < 400:
-            new_etag = resp.headers.get("ETag")
-            new_lm = resp.headers.get("Last-Modified")
-            return {"changed": True, "etag": new_etag, "last_modified": new_lm}
-        
-        return {"changed": True, "etag": None, "last_modified": None}
+            logger.debug("[Enhancer] %s 未更新 (304)", url)
+            return False, new_headers
+        return True, new_headers
     except Exception as e:
-        logger.debug("check_page_changed 失败 %s: %s", url, e)
-        return {"changed": True, "etag": None, "last_modified": None}
+        logger.warning("[Enhancer] 条件请求失败 %s: %s", url, e)
+        return True, None
 
 
 # ============================================================
-# 3. 智能重试
+# 智能重试
 # ============================================================
-def smart_retry(fn, max_retries=3, retry_on=None):
-    """
-    智能重试：对特定错误码等待后重试
-    retry_on: 需要重试的错误关键词列表
-    """
-    if retry_on is None:
-        retry_on = ["503", "502", "timeout", "429",
-                     "rate limit", "too many", "temporarily"]
-    
-    last_err = None
-    for attempt in range(max_retries + 1):
-        result, err = fn()
-        
-        if err is None:
-            return result, None
-        
-        # 检查是否值得重试
-        err_lower = str(err).lower()
-        should_retry = any(kw in err_lower for kw in retry_on)
-        
-        if should_retry and attempt < max_retries:
-            wait = min(5 * (2 ** attempt) + random.uniform(1, 3), 60)
-            logger.info("第%d次重试，等待%.1fs: %s", attempt + 1, wait, err)
-            time.sleep(wait)
-            last_err = err
-        else:
-            return result, err
-    
-    return None, last_err
+def smart_retry(func, max_retries: int = 3, retryable_errors: Optional[List[str]] = None) -> Any:
+    """带指数退避的智能重试装饰器。
 
+    Args:
+        func: 要执行的无参 callable。
+        max_retries: 最大重试次数。
+        retryable_errors: 可重试的错误关键词列表。
 
-# ============================================================
-# 4. Sitemap 发现
-# ============================================================
-def discover_sitemap(base_url, _depth=0, _max_depth=3) -> list:
+    Returns:
+        func() 的返回值，或重试耗尽后的最后一次异常。
     """
-    从网站发现 sitemap，返回所有页面URL列表。
-    递归深度限制为 _max_depth 层，防止循环引用导致栈溢出。
-    """
-    if _depth > _max_depth:
-        logger.warning("Sitemap 递归深度已达 %d 层，停止继续发现", _depth)
-        return []
+    if retryable_errors is None:
+        retryable_errors = ["timeout", "503", "429", "502", "504", "connection", "reset"]
 
-    try:
-        from curl_cffi import requests as cffi_requests
-    except ImportError:
-        return []
-    
-    parsed = urlparse(base_url)
-    base = f"{parsed.scheme}://{parsed.netloc}"
-    
-    sitemap_urls = [
-        f"{base}/sitemap.xml",
-        f"{base}/sitemap_index.xml",
-        f"{base}/sitemaps.xml",
-        f"{base}/sitemap/sitemap.xml",
-        f"{base}/sitemap.xml.gz",
-    ]
-    
-    all_urls = []
-    
-    for sitemap_url in sitemap_urls:
+    last_exception = None
+    for attempt in range(max_retries):
         try:
-            resp = cffi_requests.get(sitemap_url, impersonate="chrome120", timeout=10)
-            if resp.status_code != 200:
-                continue
-            
-            text = resp.text
-            sub_sitemaps = re.findall(r'<loc>(https?://[^<]+\.xml[^<]*)</loc>', text)
-            if sub_sitemaps:
-                for sub in sub_sitemaps:
-                    all_urls.extend(
-                        discover_sitemap(sub, _depth=_depth + 1,
-                                        _max_depth=_max_depth)
-                    )
-                continue
-            
-            urls = re.findall(r'<loc>(https?://[^<]+)</loc>', text)
-            all_urls.extend(urls)
-            
-            if all_urls:
-                logger.info("从 %s 发现 %d 个URL", sitemap_url, len(urls))
-                break
+            return func()
         except Exception as e:
-            logger.debug("Sitemap 请求失败 %s: %s", sitemap_url, e)
-            continue
-    
+            last_exception = e
+            error_str = str(e).lower()
+            can_retry = any(keyword in error_str for keyword in retryable_errors)
+            if not can_retry or attempt >= max_retries - 1:
+                raise
+            wait_time = min(2 ** attempt + random.uniform(0, 1), 60)
+            logger.warning(
+                "[Enhancer] 请求失败(第%d/%d次)，%s。%.1f秒后重试...",
+                attempt + 1, max_retries, e, wait_time,
+            )
+            time.sleep(wait_time)
+
+    if last_exception:
+        raise last_exception
+
+
+# ============================================================
+# Sitemap 递归发现
+# ============================================================
+def discover_sitemap(domain: str, depth: int = 0) -> List[str]:
+    """递归发现网站的 sitemap 及其中包含的所有 URL。
+
+    Args:
+        domain: 网站域名，如 "https://example.com"。
+        depth: 当前递归深度（最大 MAX_SITEMAP_DEPTH）。
+
+    Returns:
+        发现的 URL 列表。
+    """
+    # SSRF 校验
+    err = _validate_url(domain)
+    if err:
+        logger.warning("[Enhancer] sitemap 域名校验失败: %s", err)
+        return []
+
+    if depth > MAX_SITEMAP_DEPTH:
+        logger.warning("[Enhancer] sitemap 递归深度超限 (%d > %d)", depth, MAX_SITEMAP_DEPTH)
+        return []
+
+    urls: List[str] = []
+    sitemap_urls_to_check = []
+
+    # 1. 检查 robots.txt
+    robots_url = f"{domain.rstrip('/')}/robots.txt"
+    try:
+        import requests
+        resp = requests.get(robots_url, timeout=10)
+        if resp.status_code == 200:
+            for line in resp.text.split("\n"):
+                if line.lower().startswith("sitemap:"):
+                    sitemap_url = line.split(":", 1)[1].strip()
+                    sitemap_urls_to_check.append(sitemap_url)
+    except Exception as e:
+        logger.debug("[Enhancer] robots.txt 读取失败: %s", e)
+
+    # 2. 常见的 sitemap 路径
+    common_paths = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap/sitemap.xml"]
+    for path in common_paths:
+        sitemap_urls_to_check.append(f"{domain.rstrip('/')}{path}")
+
     # 去重
-    return list(dict.fromkeys(all_urls))
+    sitemap_urls_to_check = list(set(sitemap_urls_to_check))
+
+    # 3. 解析每个 sitemap
+    import requests
+    for sitemap_url in sitemap_urls_to_check:
+        try:
+            time.sleep(SITEMAP_DELAY)
+            resp = requests.get(sitemap_url, timeout=10)
+            if resp.status_code == 200:
+                content = resp.text
+                # 提取 <loc> 标签
+                locs = re.findall(r"<loc>\s*(.*?)\s*</loc>", content)
+                for loc in locs:
+                    if loc.endswith(".xml"):
+                        # 嵌套 sitemap，递归解析
+                        if depth < MAX_SITEMAP_DEPTH:
+                            sub_urls = discover_sitemap(loc, depth + 1)
+                            urls.extend(sub_urls)
+                    else:
+                        urls.append(loc)
+        except Exception as e:
+            logger.debug("[Enhancer] sitemap 解析失败 %s: %s", sitemap_url, e)
+
+    urls = list(set(urls))
+    logger.info("[Enhancer] sitemap 发现 %d 个 URL（域名: %s, 深度: %d）", len(urls), domain, depth)
+    return urls
 
 
 # ============================================================
-# 5. 缓存层
+# 内容缓存 & SHA-256 去重
 # ============================================================
-CACHE_DB_PATH = Path(__file__).parent.parent / ".cache" / "page_cache.db"
-
 class PageCache:
-    """本地页面缓存"""
-    
-    def __init__(self, ttl_hours=24):
-        self.ttl_seconds = ttl_hours * 3600
+    """基于 SQLite + SHA-256 的页面内容缓存，支持去重和 TTL 过期。"""
+
+    def __init__(self, db_path: str = CACHE_DB_PATH, ttl_hours: int = CACHE_TTL_HOURS):
+        self._db_path = db_path
+        self._ttl_hours = ttl_hours
         self._init_db()
-    
-    def _init_db(self):
-        CACHE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(CACHE_DB_PATH))
+
+    def _init_db(self) -> None:
+        """初始化缓存数据库表。"""
+        conn = get_db(self._db_path)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS cache (
+            CREATE TABLE IF NOT EXISTS page_cache (
                 url TEXT PRIMARY KEY,
+                content_hash TEXT,
                 content TEXT,
-                etag TEXT,
-                last_modified TEXT,
-                cached_at REAL,
-                content_hash TEXT
+                headers TEXT,
+                cached_at TEXT DEFAULT (datetime('now'))
             )
         """)
         conn.commit()
-        conn.close()
-    
-    def get(self, url) -> dict | None:
-        """获取缓存，过期返回 None"""
-        conn = sqlite3.connect(str(CACHE_DB_PATH))
-        row = conn.execute(
-            "SELECT content, etag, last_modified, cached_at, content_hash "
-            "FROM cache WHERE url = ?",
-            (url,)
-        ).fetchone()
-        conn.close()
-        
-        if not row:
-            return None
-        
-        content, etag, lm, cached_at, content_hash = row
-        
-        if time.time() - cached_at > self.ttl_seconds:
-            return None
-        
-        return {
-            "content": content,
-            "etag": etag,
-            "last_modified": lm,
-            "content_hash": content_hash,
-        }
-    
-    def set(self, url: str, content: str, etag=None, last_modified=None):
-        """写入缓存"""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(str(CACHE_DB_PATH))
+
+    def get(self, url: str) -> Optional[Dict]:
+        """从缓存获取页面内容。
+
+        Returns:
+            缓存命中返回 {"content": str, "headers": str}，未命中或过期返回 None。
+        """
+        conn = get_db(self._db_path)
+        cursor = conn.execute(
+            "SELECT content, headers, cached_at FROM page_cache WHERE url=?",
+            (url,),
+        )
+        row = cursor.fetchone()
+        if row:
+            content, headers, cached_at = row
+            try:
+                cache_time = datetime.strptime(cached_at, "%Y-%m-%d %H:%M:%S")
+                if datetime.now() - cache_time < timedelta(hours=self._ttl_hours):
+                    return {"content": content, "headers": headers}
+            except ValueError:
+                pass
+            # 过期，清理
+            conn.execute("DELETE FROM page_cache WHERE url=?", (url,))
+            conn.commit()
+        return None
+
+    def set(self, url: str, content: str, headers: Optional[str] = None) -> None:
+        """保存页面内容到缓存。"""
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        conn = get_db(self._db_path)
+        # 去重检查：相同哈希不重复存储
+        cursor = conn.execute(
+            "SELECT content_hash FROM page_cache WHERE url=?",
+            (url,),
+        )
+        existing = cursor.fetchone()
+        if existing and existing[0] == content_hash:
+            logger.debug("[Cache] 内容未变，跳过更新: %s", url)
+            return
+
         conn.execute(
-            """INSERT OR REPLACE INTO cache
-               (url, content, etag, last_modified, cached_at, content_hash)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (url, content, etag, last_modified, time.time(), content_hash)
+            "INSERT OR REPLACE INTO page_cache (url, content_hash, content, headers) "
+            "VALUES (?, ?, ?, ?)",
+            (url, content_hash, content, headers),
         )
         conn.commit()
-        conn.close()
-    
-    def is_changed(self, url: str, new_content: str) -> bool:
-        """检查内容是否有变化"""
-        new_hash = hashlib.sha256(new_content.encode()).hexdigest()
-        conn = sqlite3.connect(str(CACHE_DB_PATH))
-        row = conn.execute(
-            "SELECT content_hash FROM cache WHERE url = ?", (url,)
-        ).fetchone()
-        conn.close()
-        
-        if not row:
-            return True
-        return row[0] != new_hash
-    
-    def clear_expired(self):
-        """清理过期缓存"""
-        cutoff = time.time() - self.ttl_seconds
-        conn = sqlite3.connect(str(CACHE_DB_PATH))
-        conn.execute("DELETE FROM cache WHERE cached_at < ?", (cutoff,))
-        count = conn.total_changes
+
+    def is_duplicate(self, url: str, content: str) -> bool:
+        """检查内容是否与缓存中的内容重复。"""
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        conn = get_db(self._db_path)
+        cursor = conn.execute(
+            "SELECT content_hash FROM page_cache WHERE content_hash=?",
+            (content_hash,),
+        )
+        return cursor.fetchone() is not None
+
+    def clear_expired(self) -> int:
+        """清理过期缓存，返回清理数量。"""
+        conn = get_db(self._db_path)
+        cutoff = (datetime.now() - timedelta(hours=self._ttl_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        cursor = conn.execute("DELETE FROM page_cache WHERE cached_at < ?", (cutoff,))
         conn.commit()
-        conn.close()
-        return count
+        return cursor.rowcount
 
 
 # ============================================================
-# 6. robots.txt 检查
+# robots.txt 合规
 # ============================================================
 class RobotsChecker:
-    """robots.txt 合规检查"""
-    
-    def __init__(self):
-        self._parsers = {}  # {domain: RobotFileParser}
-    
-    def can_fetch(self, url: str, user_agent="*") -> bool:
-        """检查是否允许爬取"""
-        parsed = urlparse(url)
-        domain = parsed.netloc
-        
+    """检查 URL 是否符合 robots.txt 规则。"""
+
+    def __init__(self, user_agent: str = "*"):
+        self._user_agent = user_agent
+        self._parsers: Dict[str, RobotFileParser] = {}
+        self._crawl_delays: Dict[str, float] = {}
+
+    def _get_parser(self, url: str) -> Optional[RobotFileParser]:
+        domain = urlparse(url).scheme + "://" + urlparse(url).netloc
         if domain not in self._parsers:
             rp = RobotFileParser()
-            robots_url = f"{parsed.scheme}://{domain}/robots.txt"
+            robots_url = f"{domain}/robots.txt"
             try:
-                from curl_cffi import requests as cffi_requests
-                resp = cffi_requests.get(
-                    robots_url, impersonate="chrome120", timeout=5
-                )
-                if resp.status_code == 200:
-                    rp.parse(resp.text.splitlines())
-                else:
-                    rp.parse([])
+                rp.set_url(robots_url)
+                rp.read()
+                self._parsers[domain] = rp
+                # 尝试解析 Crawl-delay
+                self._extract_crawl_delay(robots_url, domain)
             except Exception as e:
-                logger.debug("robots.txt 获取失败 %s: %s", robots_url, e)
-                rp.parse([])
-            
-            self._parsers[domain] = rp
-        
-        return self._parsers[domain].can_fetch(user_agent, url)
-    
-    def get_crawl_delay(self, url: str) -> float:
-        """获取建议的爬取延迟"""
-        parsed = urlparse(url)
-        domain = parsed.netloc
-        
-        if domain not in self._parsers:
-            self.can_fetch(url)  # 初始化
-        
-        rp = self._parsers.get(domain)
-        if rp:
-            delay = rp.crawl_delay("*")
-            if delay and delay > 0:
-                return float(delay)
-        
-        return 0.0  # 无限制
+                logger.debug("[Robots] 读取 robots.txt 失败 %s: %s", robots_url, e)
+                self._parsers[domain] = None
+        return self._parsers.get(domain)
+
+    def _extract_crawl_delay(self, robots_url: str, domain: str) -> None:
+        """提取 robots.txt 中的 Crawl-delay 值。"""
+        try:
+            import requests
+            resp = requests.get(robots_url, timeout=5)
+            if resp.status_code == 200:
+                for line in resp.text.split("\n"):
+                    line = line.strip().lower()
+                    if line.startswith("crawl-delay:"):
+                        delay_str = line.split(":", 1)[1].strip()
+                        try:
+                            self._crawl_delays[domain] = float(delay_str)
+                            logger.info("[Robots] %s Crawl-delay: %.1fs", domain, self._crawl_delays[domain])
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+
+    def can_fetch(self, url: str) -> bool:
+        """检查给定 URL 是否允许抓取。"""
+        parser = self._get_parser(url)
+        if parser is None:
+            return True  # 无法获取 robots.txt 时默认允许
+        return parser.can_fetch(self._user_agent, url)
+
+    def get_crawl_delay(self, url: str) -> Optional[float]:
+        """获取指定域名的 Crawl-delay。"""
+        domain = urlparse(url).scheme + "://" + urlparse(url).netloc
+        return self._crawl_delays.get(domain)
 
 
 # ============================================================
-# 统一增强管理器
+# 统一管理器
 # ============================================================
 class ScrapingEnhancer:
-    """整合所有增强功能"""
-    
-    def __init__(self):
-        self.rate_limiter = DomainRateLimiter(min_interval=5, max_interval=30)
-        self.cache = PageCache(ttl_hours=24)
-        self.robots = RobotsChecker()
-    
-    def pre_fetch_check(self, url: str) -> dict:
-        """抓取前检查：robots + 缓存 + 限速"""
-        if not self.robots.can_fetch(url):
-            return {"allowed": False, "reason": "robots.txt 禁止"}
-        
-        cached = self.cache.get(url)
-        if cached:
-            return {"allowed": True, "cached": True, "cache": cached}
-        
-        crawl_delay = self.robots.get_crawl_delay(url)
-        if crawl_delay > 0:
-            self.rate_limiter.min_interval = max(
-                self.rate_limiter.min_interval, crawl_delay
-            )
-        
-        self.rate_limiter.wait_if_needed(url)
-        
-        return {"allowed": True, "cached": False}
-    
-    def post_fetch(self, url: str, content: str,
-                   etag=None, last_modified=None):
-        """抓取后处理：缓存"""
-        if content:
-            self.cache.set(url, content, etag, last_modified)
+    """增强功能统一管理器。
+
+    整合域名限速、增量抓取、智能重试、Sitemap 发现、内容缓存和 robots.txt 合规。
+    """
+
+    def __init__(self, respect_robots: bool = False, use_cache: bool = True):
+        self.rate_limiter = DomainRateLimiter()
+        self.robots = RobotsChecker() if respect_robots else None
+        self.cache = PageCache() if use_cache else None
+
+    def pre_fetch_check(self, url: str) -> Tuple[bool, Optional[Dict]]:
+        """抓取前的预处理检查。
+
+        Returns:
+            (是否应该继续抓取, 已有的缓存数据)
+        """
+        # robots.txt 检查
+        if self.robots and not self.robots.can_fetch(url):
+            logger.info("[Enhancer] robots.txt 禁止抓取: %s", url)
+            return False, None
+
+        # 域名限速
+        self.rate_limiter.wait(url)
+
+        # 缓存检查
+        if self.cache:
+            cached = self.cache.get(url)
+            if cached:
+                logger.debug("[Enhancer] 缓存命中: %s", url)
+                return False, cached
+
+        return True, None
+
+    def post_fetch(self, url: str, content: str, headers: Optional[Dict] = None) -> bool:
+        """抓取后的后处理（缓存存储等）。
+
+        Returns:
+            内容是否为新增（非重复）。
+        """
+        if self.cache:
+            is_dup = self.cache.is_duplicate(url, content)
+            self.cache.set(url, content, str(headers) if headers else None)
+            return not is_dup
+        return True

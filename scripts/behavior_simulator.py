@@ -1,193 +1,196 @@
 #!/usr/bin/env python3
 """
-行为模拟器 - 纯Python，零外部API
-模拟真人浏览行为：鼠标轨迹、滚动曲线、随机停顿、键盘节奏
-用于浏览器自动化时降低被反爬系统检测的概率
+Aelura 行为模拟器
+模拟真人浏览行为：鼠标轨迹（贝塞尔曲线）、滚动节奏、打字间隔等。
+用于 Playwright 浏览器层级的反检测增强。
+
+v2.0: 魔法数字常量化，增加类型注解。
 """
+
+from __future__ import annotations
 
 import math
 import random
 import time
+from typing import List, Tuple, Optional
+
+# ============================================================
+# 常量
+# ============================================================
+MOUSE_STEP_DISTANCE: int = 30           # 鼠标轨迹采样间隔（像素）
+SCROLL_BACK_PROBABILITY: float = 0.08   # 滚动过程中回滚的概率
+LONG_PAUSE_PROBABILITY: float = 0.1     # 长停顿概率（10%）
+LONG_PAUSE_MULTIPLIER_MIN: int = 2      # 长停顿倍率下限
+LONG_PAUSE_MULTIPLIER_MAX: int = 4      # 长停顿倍率上限
+HESITATION_PROBABILITY: float = 0.05    # 打字犹豫概率
+HESITATION_MULTIPLIER_MIN: int = 3      # 犹豫倍率下限
+HESITATION_MULTIPLIER_MAX: int = 8      # 犹豫倍率上限
+RETURN_TO_TOP_PROBABILITY: float = 0.2  # 浏览结束后回到顶部的概率
+QUICK_BURST_PROBABILITY: float = 0.15   # 快速连续滚动概率
+LONG_LEAVE_PROBABILITY: float = 0.05    # 长时间离开概率
+BASE_TYPE_DELAY_MIN: float = 0.05       # 基础打字延迟下限（秒）
+BASE_TYPE_DELAY_MAX: float = 0.2        # 基础打字延迟上限（秒）
+SENTENCE_START_PAUSE_MIN: float = 0.3   # 句首停顿下限
+SENTENCE_START_PAUSE_MAX: float = 0.6   # 句首停顿上限
+SCROLL_PX_PER_STEP_MIN: int = 100       # 每步滚动像素下限
+SCROLL_PX_PER_STEP_MAX: int = 500       # 每步滚动像素上限
 
 
-def human_pause(min_s=1.0, max_s=3.0) -> float:
-    """模拟真人阅读停顿"""
-    wait = random.uniform(min_s, max_s)
-    # 偶尔出现较长的停顿（像在仔细看某段内容）
-    if random.random() < 0.1:
-        wait *= random.uniform(2, 4)
-    time.sleep(wait)
-    return wait
+def _gauss_noise(mu: float = 0.0, sigma: float = 1.0) -> float:
+    """高斯噪声。"""
+    return random.gauss(mu, sigma)
 
 
-def generate_mouse_path(from_x, from_y, to_x, to_y, steps=None) -> list:
+def _quadratic_bezier(p0: Tuple[float, float],
+                      p1: Tuple[float, float],
+                      p2: Tuple[float, float],
+                      t: float) -> Tuple[float, float]:
+    """二次贝塞尔曲线插值。"""
+    x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0]
+    y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]
+    return (x, y)
+
+
+def generate_mouse_path(start: Tuple[int, int],
+                        end: Tuple[int, int],
+                        num_control_points: int = 2) -> List[Tuple[int, int]]:
     """
-    生成真人鼠标移动轨迹
-    使用贝塞尔曲线 + 随机扰动，模拟人手移动的自然弧度
+    生成一条模拟真人鼠标移动的贝塞尔曲线路径。
+
+    Args:
+        start: 起点 (x, y)
+        end: 终点 (x, y)
+        num_control_points: 控制点数量（越多越弯曲）
+
+    Returns:
+        路径点列表 [(x, y), ...]
     """
-    if steps is None:
-        distance = math.sqrt((to_x - from_x) ** 2 + (to_y - from_y) ** 2)
-        steps = max(5, int(distance / 30))  # 每30像素一步
+    # 生成随机控制点
+    control_points = [start]
+    for _ in range(num_control_points):
+        cx = (start[0] + end[0]) / 2 + _gauss_noise(0, abs(end[0] - start[0]) * 0.3 + 1)
+        cy = (start[1] + end[1]) / 2 + _gauss_noise(0, abs(end[1] - start[1]) * 0.3 + 1)
+        control_points.append((cx, cy))
+    control_points.append(end)
 
-    points = []
-
-    # 控制点（产生弧度）
-    ctrl_x = (from_x + to_x) / 2 + random.uniform(-100, 100)
-    ctrl_y = (from_y + to_y) / 2 + random.uniform(-100, 100)
+    # 使用多段贝塞尔拼接，简化为分段线性采样
+    path: List[Tuple[int, int]] = []
+    distance = math.hypot(end[0] - start[0], end[1] - start[1])
+    steps = max(int(distance / MOUSE_STEP_DISTANCE), 5)
 
     for i in range(steps + 1):
         t = i / steps
-        # 二次贝塞尔曲线
-        x = (1 - t) ** 2 * from_x + 2 * (1 - t) * t * ctrl_x + t ** 2 * to_x
-        y = (1 - t) ** 2 * from_y + 2 * (1 - t) * t * ctrl_y + t ** 2 * to_y
-        # 添加微小抖动（人手不可能完全精准）
-        x += random.gauss(0, 1.5)
-        y += random.gauss(0, 1.5)
-        points.append((round(x, 1), round(y, 1)))
-
-    return points
-
-
-def generate_scroll_sequence(page_height, viewport_height, target_ratio=None) -> list:
-    """
-    生成真人滚动序列
-    特征：不均匀速度、偶尔回滚、末端减速
-    """
-    max_scroll = page_height - viewport_height
-    if max_scroll <= 0:
-        return [0]
-
-    if target_ratio is None:
-        target_ratio = random.uniform(0.6, 1.0)
-
-    target_pos = int(max_scroll * target_ratio)
-
-    scrolls = []
-    current_pos = 0
-    remaining = target_pos
-
-    while remaining > 5:
-        # 每次滚动距离：大多在50-300px之间
-        if remaining > 500:
-            step = random.randint(100, 400)
-        elif remaining > 100:
-            step = random.randint(50, 200)
+        # 在控制点序列上做线性插值近似
+        if len(control_points) == 3:
+            pt = _quadratic_bezier(control_points[0], control_points[1], control_points[2], t)
         else:
-            step = random.randint(10, remaining)
+            # 多点简化：按 t 在首尾和控制点之间插值
+            pt = (
+                start[0] + (end[0] - start[0]) * t + _gauss_noise(0, 2),
+                start[1] + (end[1] - start[1]) * t + _gauss_noise(0, 2),
+            )
+        path.append((int(pt[0]), int(pt[1])))
 
-        # 偶尔回滚（真人经常往回翻一点）
-        if random.random() < 0.08 and len(scrolls) > 2:
-            step = -random.randint(20, 80)
+    # 确保终点精确
+    if path[-1] != end:
+        path.append(end)
+    return path
 
-        current_pos += step
-        current_pos = max(0, min(current_pos, max_scroll))
-        scrolls.append(current_pos)
-        remaining = target_pos - current_pos
 
-        if remaining < 0:
+def generate_scroll_sequence(total_height: int = 3000,
+                             viewport_height: int = 900) -> List[Tuple[int, float]]:
+    """
+    生成模拟真人阅读习惯的滚动序列。
+
+    Returns:
+        [(scroll_delta_px, pause_seconds), ...]
+    """
+    sequence: List[Tuple[int, float]] = []
+    current_pos = 0
+
+    while current_pos < total_height - viewport_height:
+        # 不均匀速度：大部分时候中等滚动，偶尔快速或慢速
+        if random.random() < QUICK_BURST_PROBABILITY:
+            scroll_px = random.randint(SCROLL_PX_PER_STEP_MAX, SCROLL_PX_PER_STEP_MAX * 2)
+        else:
+            scroll_px = random.randint(SCROLL_PX_PER_STEP_MIN, SCROLL_PX_PER_STEP_MAX)
+
+        # 偶尔回滚（模拟回看）
+        if random.random() < SCROLL_BACK_PROBABILITY and current_pos > 200:
+            scroll_px = -random.randint(50, 200)
+        
+        current_pos = max(0, min(current_pos + scroll_px, total_height - viewport_height))
+        
+        # 停顿时间：模拟阅读速度
+        base_pause = random.uniform(0.5, 3.0)
+        # 10% 概率出现长停顿（去倒水、看手机等）
+        if random.random() < LONG_PAUSE_PROBABILITY:
+            base_pause *= random.uniform(LONG_PAUSE_MULTIPLIER_MIN, LONG_PAUSE_MULTIPLIER_MAX)
+        
+        sequence.append((scroll_px, base_pause))
+
+        if current_pos >= total_height - viewport_height:
             break
 
-    return scrolls
+    return sequence
 
 
-def generate_typing_rhythm(text: str) -> list:
+def generate_typing_rhythm(text: str) -> List[Tuple[str, float]]:
     """
-    生成真人打字节奏（每个字符的延迟，单位毫秒）
-    特征：不均匀速度、偶尔停顿思考、纠错回删
+    模拟真人打字节奏。
+
+    Returns:
+        [(char, delay_seconds), ...]
     """
-    delays = []
-    i = 0
-    while i < len(text):
-        # 基础延迟：50-200ms
-        delay = random.randint(50, 200)
+    result: List[Tuple[str, float]] = []
+    sentence_starters = {'.', '!', '?', '。', '！', '？', '\n'}
 
-        # 句首慢一点
-        if i == 0 or (i > 0 and text[i - 1] in "。！？.!?"):
-            delay *= random.randint(2, 4)
+    for i, char in enumerate(text):
+        delay = random.uniform(BASE_TYPE_DELAY_MIN, BASE_TYPE_DELAY_MAX)
 
-        # 长词中间可能犹豫
-        if random.random() < 0.05:
-            delay *= random.randint(3, 8)
+        # 句首停顿更长
+        if i > 0 and text[i - 1] in sentence_starters:
+            delay += random.uniform(SENTENCE_START_PAUSE_MIN, SENTENCE_START_PAUSE_MAX)
 
-        delays.append(delay)
-        i += 1
+        # 5% 概率犹豫
+        if random.random() < HESITATION_PROBABILITY:
+            delay *= random.uniform(HESITATION_MULTIPLIER_MIN, HESITATION_MULTIPLIER_MAX)
 
-    return delays
+        result.append((char, delay))
+
+    return result
 
 
-def generate_hover_before_click(page) -> None:
+def simulate_page_browsing(page, total_height: int = 3000) -> None:
     """
-    在点击前先hover到目标元素（真人不会直接点）
-    需要在Playwright环境中调用
+    模拟一次完整的页面浏览行为（滚动 + 停顿 + 偶尔回滚）。
+
+    Args:
+        page: Playwright Page 对象
+        total_height: 页面总高度（像素）
     """
+    viewport_height = 900
     try:
-        page.mouse.move(
-            random.randint(100, 800),
-            random.randint(100, 600),
-            steps=random.randint(5, 15)
-        )
-        time.sleep(random.uniform(0.3, 1.2))
+        viewport_height = page.viewport_size.get("height", 900) if page.viewport_size else 900
     except Exception:
         pass
 
+    sequence = generate_scroll_sequence(total_height, viewport_height)
 
-def simulate_page_browsing(page, max_scroll_ratio=0.9) -> None:
-    """
-    模拟真人浏览页面：进入 → 停顿 → 滚动 → 再停顿 → 可能回滚
-    需要在Playwright环境中调用
-    """
-    try:
-        # 1. 页面加载后先看一会
-        human_pause(1.5, 3.5)
+    for scroll_px, pause in sequence:
+        try:
+            page.mouse.wheel(0, scroll_px)
+        except Exception:
+            pass
+        time.sleep(pause)
 
-        # 2. 获取页面高度
-        page_height = page.evaluate("document.body.scrollHeight")
-        viewport_height = page.evaluate("window.innerHeight")
-
-        if page_height <= viewport_height:
-            # 页面太短不需要滚动
-            human_pause(1, 2)
-            return
-
-        # 3. 生成滚动序列
-        scroll_seq = generate_scroll_sequence(
-            page_height, viewport_height, max_scroll_ratio
-        )
-
-        # 4. 执行滚动
-        for pos in scroll_seq:
-            page.evaluate(f"window.scrollTo(0, {pos})")
-            # 每次滚动后停顿
-            human_pause(0.5, 2.0)
-
-        # 5. 偶尔回到顶部再看看
-        if random.random() < 0.2:
+    # 浏览结束后：20% 概率回到顶部，5% 概率长时间停留后离开
+    if random.random() < RETURN_TO_TOP_PROBABILITY:
+        try:
             page.evaluate("window.scrollTo(0, 0)")
-            human_pause(1, 3)
+        except Exception:
+            pass
+        time.sleep(random.uniform(0.5, 2.0))
 
-    except Exception:
-        # 行为模拟失败不影响数据抓取
-        pass
-
-
-def generate_request_timing(request_count: int) -> list:
-    """
-    生成一组请求的时间间隔序列
-    模拟真人访问多个页面的节奏
-    """
-    intervals = []
-    for _ in range(request_count):
-        # 基础间隔 5-25 秒
-        interval = random.uniform(5, 25)
-
-        # 偶尔快速连续访问（像在翻页）
-        if random.random() < 0.15:
-            interval = random.uniform(1, 3)
-
-        # 偶尔长时间离开（像去干别的了）
-        if random.random() < 0.05:
-            interval = random.uniform(60, 300)
-
-        intervals.append(interval)
-
-    return intervals
+    if random.random() < LONG_LEAVE_PROBABILITY:
+        time.sleep(random.uniform(5.0, 15.0))
